@@ -66,6 +66,7 @@
 #include "textfile.h"
 #include "storage.h"
 #include "attrib-server.h"
+#include "gatt-client.h"
 
 #define IO_CAPABILITY_NOINPUTNOOUTPUT	0x03
 
@@ -187,6 +188,9 @@ struct btd_device {
 	GSList		*uuids;
 	GSList		*primaries;		/* List of primary services */
 	GSList		*services;		/* List of btd_service */
+
+	struct btd_gatt_client *gatt_client;	/* GATT client implementation */
+
 	GSList		*pending;		/* Pending services */
 	GSList		*watches;		/* List of disconnect_data */
 	gboolean	temporary;
@@ -531,6 +535,8 @@ static void svc_dev_remove(gpointer user_data)
 static void device_free(gpointer user_data)
 {
 	struct btd_device *device = user_data;
+
+	btd_gatt_client_destroy(device->gatt_client);
 
 	g_slist_free_full(device->uuids, g_free);
 	g_slist_free_full(device->primaries, g_free);
@@ -2357,6 +2363,12 @@ static struct btd_device *device_new(struct btd_adapter *adapter,
 	device->path = g_strdup_printf("%s/dev_%s", adapter_path, address_up);
 	g_strdelimit(device->path, ":", '_');
 	g_free(address_up);
+
+	device->gatt_client = btd_gatt_client_new(device);
+	if (!device->gatt_client) {
+		device_free(device);
+		return NULL;
+	}
 
 	DBG("Creating device %s", device->path);
 
