@@ -34,6 +34,7 @@
 #include <gdbus/gdbus.h>
 
 #include "dbus-common.h"
+#include "error.h"
 #include "adapter.h"
 #include "device.h"
 #include "lib/uuid.h"
@@ -44,6 +45,7 @@
 #include "log.h"
 
 #define GATT_SERVICE_IFACE		"org.bluez.GattService1"
+#define GATT_CHARACTERISTIC_IFACE	"org.bluez.GattCharacteristic1"
 
 struct btd_gatt_client {
 	struct btd_device *device;
@@ -64,9 +66,177 @@ struct gatt_dbus_service {
 	char *path;
 
 	bool characteristics_discovered;
+	bool discovering;
+
+	guint request;
+
+	GSList *characteristics;
 };
 
+struct gatt_dbus_characteristic {
+	struct gatt_dbus_service *service;
+	bt_uuid_t uuid;
+	uint16_t handle;
+	uint16_t value_handle;
+	uint8_t properties;
+	char *path;
+};
+
+/* ====== Characteristic properties/methods ====== */
+static gboolean characteristic_property_get_uuid(
+					const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	char uuid[MAX_LEN_UUID_STR + 1];
+	const char *ptr = uuid;
+	struct gatt_dbus_characteristic *characteristic = data;
+
+	bt_uuid_to_string(&characteristic->uuid, uuid, sizeof(uuid));
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &ptr);
+
+	return TRUE;
+}
+
+static gboolean characteristic_property_get_service(
+					const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct gatt_dbus_characteristic *characteristic = data;
+	const char *str = characteristic->service->path;
+
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_OBJECT_PATH, &str);
+
+	return TRUE;
+}
+
+static const GDBusPropertyTable characteristic_properties[] = {
+	{ "UUID", "s", characteristic_property_get_uuid, NULL, NULL,
+					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+	{ "Service", "o", characteristic_property_get_service, NULL, NULL,
+					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+	{}
+};
+
+static void destroy_characteristic(gpointer user_data)
+{
+	struct gatt_dbus_characteristic *characteristic = user_data;
+
+	g_free(characteristic->path);
+	g_free(characteristic);
+}
+
+static void unregister_characteristic(gpointer user_data)
+{
+	struct gatt_dbus_characteristic *characteristic = user_data;
+
+	g_dbus_unregister_interface(btd_get_dbus_connection(),
+						characteristic->path,
+						GATT_CHARACTERISTIC_IFACE);
+}
+
+struct gatt_dbus_characteristic *gatt_dbus_characteristic_create(
+					struct gatt_dbus_service *service,
+					struct gatt_char *chr)
+{
+	struct gatt_dbus_characteristic *characteristic;
+	bt_uuid_t uuid;
+
+	characteristic = g_try_new0(struct gatt_dbus_characteristic, 1);
+	if (!characteristic)
+		return NULL;
+
+	characteristic->path = g_strdup_printf("%s/char%04x", service->path,
+								chr->handle);
+
+	characteristic->service = service;
+	characteristic->handle = chr->handle;
+	characteristic->value_handle = chr->value_handle;
+	characteristic->properties = chr->properties;
+
+	if (bt_string_to_uuid(&uuid, chr->uuid)) {
+		error("GATT characteristic has invalid UUID: %s", chr->uuid);
+		goto fail;
+	}
+
+	bt_uuid_to_uuid128(&uuid, &characteristic->uuid);
+
+	if (!g_dbus_register_interface(btd_get_dbus_connection(),
+						characteristic->path,
+						GATT_CHARACTERISTIC_IFACE,
+						NULL, NULL,
+						characteristic_properties,
+						characteristic,
+						destroy_characteristic)) {
+		error("Failed to register GATT characteristic: UUID: %s",
+								chr->uuid);
+		goto fail;
+	}
+
+	DBG("GATT characteristic created: %s", characteristic->path);
+
+	return characteristic;
+
+fail:
+	destroy_characteristic(characteristic);
+	return NULL;
+}
+
 /* ====== Service properties/methods ====== */
+static void gatt_discover_characteristics_cb(uint8_t status,
+							GSList *characteristics,
+							void *user_data)
+{
+	struct gatt_dbus_service *service = user_data;
+	struct gatt_dbus_characteristic *characteristic;
+	struct gatt_char *chr;
+	GSList *l;
+
+	DBG("GATT characteristic discovery status: %u", status);
+
+	service->request = 0;
+
+	if (status)
+		return;
+
+	for (l = characteristics; l; l = g_slist_next(l)) {
+		chr = l->data;
+		characteristic = gatt_dbus_characteristic_create(service, chr);
+		if (!characteristic)
+			continue;
+
+		service->characteristics = g_slist_append(
+						service->characteristics,
+						characteristic);
+	}
+
+	service->characteristics_discovered = true;
+	service->discovering = false;
+}
+
+static void service_discover_characteristics(struct gatt_dbus_service *service)
+{
+	guint request;
+
+	if (service->request)
+		return;
+
+	if (service->characteristics_discovered)
+		return;
+
+	if (service->discovering)
+		return;
+
+	if ((request = gatt_discover_char(service->client->attrib,
+					service->handle_range.start,
+					service->handle_range.end,
+					NULL, gatt_discover_characteristics_cb,
+					service)))
+		return;
+
+	service->request = request;
+	service->discovering = false;
+}
+
 static gboolean service_property_get_uuid(const GDBusPropertyTable *property,
 					DBusMessageIter *iter, void *data)
 {
@@ -113,9 +283,31 @@ static const GDBusPropertyTable service_properties[] = {
 	{}
 };
 
+static void cancel_pending_service_requests(struct gatt_dbus_service *service)
+{
+	if (service->request) {
+		DBG("Canceling pending characteristic discovery request");
+		g_attrib_cancel(service->client->attrib, service->request);
+		service->request = 0;
+	}
+}
+
 static void destroy_service(gpointer user_data)
 {
 	struct gatt_dbus_service *service = user_data;
+
+	cancel_pending_service_requests(service);
+
+	/*
+	 * If this happened, and there are still characteristics lying around,
+	 * remove them.
+	 */
+	if (service->characteristics) {
+		g_slist_free_full(service->characteristics, unregister_characteristic);
+		service->characteristics = NULL;
+	}
+
+	DBG("Destroying GATT service: %s", service->path);
 
 	g_free(service->path);
 	g_free(service);
@@ -124,6 +316,16 @@ static void destroy_service(gpointer user_data)
 static void unregister_service(gpointer user_data)
 {
 	struct gatt_dbus_service *service = user_data;
+
+	DBG("Unregister GATT service: %s", service->path);
+
+	cancel_pending_service_requests(service);
+
+	/* Remove characteristics before removing the service */
+	if (service->characteristics) {
+		g_slist_free_full(service->characteristics, unregister_characteristic);
+		service->characteristics = NULL;
+	}
 
 	g_dbus_unregister_interface(btd_get_dbus_connection(),
 					service->path, GATT_SERVICE_IFACE);
@@ -154,7 +356,8 @@ static struct gatt_dbus_service *gatt_dbus_service_create(
 	bt_uuid_to_uuid128(&uuid, &service->uuid);
 
 	if (!g_dbus_register_interface(btd_get_dbus_connection(), service->path,
-						GATT_SERVICE_IFACE, NULL, NULL,
+						GATT_SERVICE_IFACE,
+						NULL, NULL,
 						service_properties,
 						service, destroy_service)) {
 		char device_addr[18];
@@ -218,6 +421,9 @@ static void discover_primary_cb(uint8_t status, GSList *services,
 		service->is_primary = true;
 
 		client->services = g_slist_append(client->services, service);
+
+		/* Discover the characteristics */
+		service_discover_characteristics(service);
 	}
 }
 
