@@ -109,10 +109,59 @@ static gboolean characteristic_property_get_service(
 	return TRUE;
 }
 
+static gboolean characteristic_property_get_flags(
+					const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct gatt_dbus_characteristic *characteristic = data;
+	DBusMessageIter array;
+	const int num_flags = 8;
+	int i;
+	const uint8_t props[] = {
+		GATT_CHR_PROP_BROADCAST,
+		GATT_CHR_PROP_READ,
+		GATT_CHR_PROP_WRITE_WITHOUT_RESP,
+		GATT_CHR_PROP_WRITE,
+		GATT_CHR_PROP_NOTIFY,
+		GATT_CHR_PROP_INDICATE,
+		GATT_CHR_PROP_AUTH,
+		GATT_CHR_PROP_EXT_PROP
+	};
+	const char *flags[] = {
+		"broadcast",
+		"read",
+		"write-without-response",
+		"write",
+		"notify",
+		"indicate",
+		"authenticated-signed-writes",
+		"extended-properties"
+	};
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "s", &array);
+
+	for (i = 0; i < num_flags; i++) {
+		if (characteristic->properties & props[i])
+			dbus_message_iter_append_basic(&array, DBUS_TYPE_STRING,
+								&flags[i]);
+	}
+
+	/*
+	 * TODO: include the extended properties here if the descriptor is
+	 * present.
+	 */
+
+	dbus_message_iter_close_container(iter, &array);
+
+	return TRUE;
+}
+
 static const GDBusPropertyTable characteristic_properties[] = {
 	{ "UUID", "s", characteristic_property_get_uuid, NULL, NULL,
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
 	{ "Service", "o", characteristic_property_get_service, NULL, NULL,
+					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+	{ "Flags", "as", characteristic_property_get_flags, NULL, NULL,
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
 	{}
 };
