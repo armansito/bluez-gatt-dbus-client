@@ -82,12 +82,19 @@ struct gatt_dbus_characteristic {
 	char *path;
 
 	guint read_request;
+	guint write_request;
 };
 
 static DBusMessage *gatt_error_read_not_permitted(DBusMessage *msg)
 {
 	return g_dbus_create_error(msg, ERROR_INTERFACE ".ReadNotPermitted",
 				"Reading of this value is not allowed");
+}
+
+static DBusMessage *gatt_error_write_not_permitted(DBusMessage *msg)
+{
+	return g_dbus_create_error(msg, ERROR_INTERFACE ".WriteNotPermitted",
+				"Writing of this value is not allowed");
 }
 
 static DBusMessage *gatt_error_authentication(DBusMessage *msg)
@@ -113,6 +120,8 @@ static DBusMessage *error_from_att_ecode(DBusMessage *msg, guint8 ecode)
 	switch (ecode) {
 	case ATT_ECODE_READ_NOT_PERM:
 		return gatt_error_read_not_permitted(msg);
+	case ATT_ECODE_WRITE_NOT_PERM:
+		return gatt_error_write_not_permitted(msg);
 	case ATT_ECODE_AUTHENTICATION:
 		return gatt_error_authentication(msg);
 	case ATT_ECODE_AUTHORIZATION:
@@ -257,6 +266,9 @@ static DBusMessage *characteristic_read_value(DBusConnection *conn,
 	struct gatt_dbus_characteristic *chrc = user_data;
 	struct gatt_char_read_op *op;
 
+	if (!chrc->client->attrib)
+		return btd_error_failed("ATT data connection uninitialized");
+
 	if (chrc->read_request)
 		return btd_error_in_progress(msg);
 
@@ -280,10 +292,117 @@ static DBusMessage *characteristic_read_value(DBusConnection *conn,
 	return NULL;
 }
 
+struct gatt_char_write_op {
+	struct gatt_dbus_characteristic *chrc;
+	DBusMessage *msg;
+};
+
+static void write_chrc_cb(guint8 status, const guint8 *pdu, guint16 len,
+							gpointer user_data)
+{
+	struct gatt_char_write_op *op = user_data;
+	DBusMessage *reply;
+
+	if (status) {
+		reply = error_from_att_ecode(op->msg, status);
+		goto done;
+	}
+
+	reply = g_dbus_create_reply(op->msg, DBUS_TYPE_INVALID);
+	if (!reply)
+		goto fail;
+
+done:
+	g_dbus_send_message(btd_get_dbus_connection(), reply);
+
+fail:
+	dbus_message_unref(op->msg);
+	op->chrc->write_request = 0;
+	g_free(op);
+}
+
+static DBusMessage *characteristic_write_value(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	struct gatt_dbus_characteristic *chrc = user_data;
+	struct gatt_char_write_op *op = NULL;
+	uint8_t *value = NULL;
+	int vlen = 0;
+	guint req;
+	DBusMessageIter iter, array;
+
+	if (!chrc->client->attrib)
+		return btd_error_failed("ATT data connection uninitialized");
+
+	if (chrc->write_request)
+		return btd_error_in_progress(msg);
+
+	if (!dbus_message_iter_init(msg, &iter))
+		return btd_error_invalid_args(msg);
+
+	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY)
+		return btd_error_invalid_args(msg);
+
+	dbus_message_iter_recurse(&iter, &array);
+	dbus_message_iter_get_fixed_array(&array, &value, &vlen);
+	dbus_message_iter_next(&iter);
+
+	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_INVALID)
+		return btd_error_invalid_args(msg);
+
+	/*
+	 * TODO: For now, only go on with the write if "write" and
+	 * "write-without-response" are supported and return an error
+	 * if the characteristic only allows "authenticated-signed-writes"
+	 * and "reliable-write"
+	 */
+	if (chrc->properties & GATT_CHR_PROP_WRITE) {
+		op = g_try_new0(struct gatt_char_write_op, 1);
+		if (!op)
+			return btd_error_failed(msg,
+						"Failed to initialize request");
+
+		op->chrc = chrc;
+		op->msg = msg;
+
+		req = gatt_write_char(chrc->service->client->attrib,
+							chrc->value_handle,
+							value, vlen,
+							write_chrc_cb, op);
+		if (!req) {
+			g_free(op);
+			return btd_error_failed(msg, "Failed to issue request");
+		}
+
+		chrc->write_request = req;
+
+		dbus_message_ref(msg);
+		return NULL;
+	}
+
+	if (!(chrc->properties & GATT_CHR_PROP_WRITE_WITHOUT_RESP))
+		return btd_error_failed(msg, "Only long writes and writes "
+					"without response are supported");
+
+	req = gatt_write_cmd(chrc->service->client->attrib,
+						chrc->value_handle,
+						value, vlen,
+						NULL, NULL);
+
+	if (!req)
+		return btd_error_failed(msg, "Failed to issue request");
+
+	return dbus_message_new_method_return(msg);
+}
+
 static const GDBusMethodTable characteristic_methods[] = {
 	{ GDBUS_EXPERIMENTAL_ASYNC_METHOD("ReadValue", NULL,
 						GDBUS_ARGS({ "value", "ay" }),
 						characteristic_read_value) },
+	{ GDBUS_EXPERIMENTAL_ASYNC_METHOD("WriteValue",
+						GDBUS_ARGS({ "value", "ay" }),
+						NULL,
+						characteristic_write_value) },
 	{ }
 };
 
@@ -309,6 +428,13 @@ static void cancel_pending_chrc_requests(struct gatt_dbus_characteristic *chrc)
 		g_attrib_cancel(chrc->service->client->attrib,
 							chrc->read_request);
 		chrc->read_request = 0;
+	}
+
+	if (chrc->write_request) {
+		DBG("Canceling pending characteristic write request");
+		g_attrib_cancel(chrc->service->client->attrib,
+							chrc->write_request);
+		chrc->write_request = 0;
 	}
 }
 
