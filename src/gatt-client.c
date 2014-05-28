@@ -80,7 +80,54 @@ struct gatt_dbus_characteristic {
 	uint16_t value_handle;
 	uint8_t properties;
 	char *path;
+
+	guint read_request;
 };
+
+static DBusMessage *gatt_error_read_not_permitted(DBusMessage *msg)
+{
+	return g_dbus_create_error(msg, ERROR_INTERFACE ".ReadNotPermitted",
+				"Reading of this value is not allowed");
+}
+
+static DBusMessage *gatt_error_authentication(DBusMessage *msg)
+{
+	return g_dbus_create_error(msg, ERROR_INTERFACE ".Authentication",
+						"Insufficient authentication");
+}
+
+static DBusMessage *gatt_error_authorization(DBusMessage *msg)
+{
+	return g_dbus_create_error(msg, ERROR_INTERFACE ".Authorization",
+						"Insufficient authorization");
+}
+
+static DBusMessage *gatt_error_encryption(DBusMessage *msg)
+{
+	return g_dbus_create_error(msg, ERROR_INTERFACE ".Encryption",
+						"Insufficient encryption");
+}
+
+static DBusMessage *error_from_att_ecode(DBusMessage *msg, guint8 ecode)
+{
+	switch (ecode) {
+	case ATT_ECODE_READ_NOT_PERM:
+		return gatt_error_read_not_permitted(msg);
+	case ATT_ECODE_AUTHENTICATION:
+		return gatt_error_authentication(msg);
+	case ATT_ECODE_AUTHORIZATION:
+		return gatt_error_authentication(msg);
+	case ATT_ECODE_INSUFF_ENC:
+	case ATT_ECODE_INSUFF_ENCR_KEY_SIZE:
+		return gatt_error_authentication(msg);
+	default:
+		return g_dbus_create_error(msg, ERROR_INTERFACE,
+				"Operation failed with ATT error code: 0x%02x",
+				ecode);
+	}
+
+	return NULL;
+}
 
 /* ====== Characteristic properties/methods ====== */
 static gboolean characteristic_property_get_uuid(
@@ -156,6 +203,95 @@ static gboolean characteristic_property_get_flags(
 	return TRUE;
 }
 
+struct gatt_char_read_op {
+	struct gatt_dbus_characteristic *chrc;
+	DBusMessage *msg;
+};
+
+static void read_chrc_cb(guint8 status, const guint8 *pdu, guint16 len,
+							gpointer user_data)
+{
+	struct gatt_char_read_op *op = user_data;
+	uint8_t value[len];
+	ssize_t vlen;
+	DBusMessageIter iter, array;
+	DBusMessage *reply;
+	int i;
+
+	if (status) {
+		reply = error_from_att_ecode(op->msg, status);
+		goto done;
+	}
+
+	vlen = dec_read_resp(pdu, len, value, sizeof(value));
+	if (vlen < 0) {
+		reply = btd_error_failed(op->msg, "Invalid response received");
+		goto done;
+	}
+
+	reply = g_dbus_create_reply(op->msg, DBUS_TYPE_INVALID);
+	if (!reply)
+		goto fail;
+
+	dbus_message_iter_init_append(reply, &iter);
+	dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "y", &array);
+
+	for (i = 0; i < vlen; i++)
+		dbus_message_iter_append_basic(&array, DBUS_TYPE_BYTE,
+								value + i);
+
+	dbus_message_iter_close_container(&iter, &array);
+
+done:
+	g_dbus_send_message(btd_get_dbus_connection(), reply);
+
+fail:
+	dbus_message_unref(op->msg);
+	op->chrc->read_request = 0;
+	g_free(op);
+}
+
+static DBusMessage *characteristic_read_value(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	struct gatt_dbus_characteristic *chrc = user_data;
+	struct gatt_char_read_op *op;
+
+	if (chrc->read_request)
+		return btd_error_in_progress(msg);
+
+	op = g_try_new0(struct gatt_char_read_op, 1);
+	if (!op)
+		return btd_error_failed(msg, "Failed to initialize request");
+
+	op->chrc = chrc;
+	op->msg = msg;
+
+	chrc->read_request = gatt_read_char(chrc->service->client->attrib,
+							chrc->value_handle,
+							read_chrc_cb, op);
+	if (!chrc->read_request) {
+		g_free(op);
+		return btd_error_failed(msg, "Failed to issue request");
+	}
+
+	dbus_message_ref(msg);
+
+	return NULL;
+}
+
+static const GDBusMethodTable characteristic_methods[] = {
+	{ GDBUS_EXPERIMENTAL_ASYNC_METHOD("ReadValue", NULL,
+						GDBUS_ARGS({ "value", "ay" }),
+						characteristic_read_value) },
+	{ }
+};
+
+static const GDBusSignalTable characteristic_signals[] = {
+	{ GDBUS_SIGNAL("ValueUpdated", GDBUS_ARGS({ "value", "ay" })) },
+	{ }
+};
+
 static const GDBusPropertyTable characteristic_properties[] = {
 	{ "UUID", "s", characteristic_property_get_uuid, NULL, NULL,
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
@@ -166,20 +302,38 @@ static const GDBusPropertyTable characteristic_properties[] = {
 	{}
 };
 
+static void cancel_pending_chrc_requests(struct gatt_dbus_characteristic *chrc)
+{
+	if (chrc->read_request) {
+		DBG("Canceling pending characteristic read request");
+		g_attrib_cancel(chrc->service->client->attrib,
+							chrc->read_request);
+		chrc->read_request = 0;
+	}
+}
+
 static void destroy_characteristic(gpointer user_data)
 {
-	struct gatt_dbus_characteristic *characteristic = user_data;
+	struct gatt_dbus_characteristic *chrc = user_data;
 
-	g_free(characteristic->path);
-	g_free(characteristic);
+	cancel_pending_chrc_requests(chrc);
+
+	DBG("Destroying GATT characteristic: %s", chrc->path);
+
+	g_free(chrc->path);
+	g_free(chrc);
 }
 
 static void unregister_characteristic(gpointer user_data)
 {
-	struct gatt_dbus_characteristic *characteristic = user_data;
+	struct gatt_dbus_characteristic *chrc = user_data;
+
+	cancel_pending_chrc_requests(chrc);
+
+	DBG("Unregistering GATT characteristic: %s", chrc->path);
 
 	g_dbus_unregister_interface(btd_get_dbus_connection(),
-						characteristic->path,
+						chrc->path,
 						GATT_CHARACTERISTIC_IFACE);
 }
 
@@ -212,7 +366,8 @@ struct gatt_dbus_characteristic *gatt_dbus_characteristic_create(
 	if (!g_dbus_register_interface(btd_get_dbus_connection(),
 						characteristic->path,
 						GATT_CHARACTERISTIC_IFACE,
-						NULL, NULL,
+						characteristic_methods,
+						characteristic_signals,
 						characteristic_properties,
 						characteristic,
 						destroy_characteristic)) {
@@ -260,6 +415,7 @@ static void gatt_discover_characteristics_cb(uint8_t status,
 
 	service->characteristics_discovered = true;
 	service->discovering = false;
+	service->request = 0;
 }
 
 static void service_discover_characteristics(struct gatt_dbus_service *service)
