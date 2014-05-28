@@ -46,6 +46,7 @@
 
 #define GATT_SERVICE_IFACE		"org.bluez.GattService1"
 #define GATT_CHARACTERISTIC_IFACE	"org.bluez.GattCharacteristic1"
+#define GATT_DESCRIPTOR_IFACE		"org.bluez.GattDescriptor1"
 
 struct btd_gatt_client {
 	struct btd_device *device;
@@ -79,6 +80,19 @@ struct gatt_dbus_characteristic {
 	uint16_t handle;
 	uint16_t value_handle;
 	uint8_t properties;
+	char *path;
+
+	guint read_request;
+	guint write_request;
+	guint desc_request;
+
+	GSList *descriptors;
+};
+
+struct gatt_dbus_descriptor {
+	struct gatt_dbus_characteristic *chrc;
+	bt_uuid_t uuid;
+	uint16_t handle;
 	char *path;
 
 	guint read_request;
@@ -138,7 +152,186 @@ static DBusMessage *error_from_att_ecode(DBusMessage *msg, guint8 ecode)
 	return NULL;
 }
 
+/* ====== Descriptor properties/methods ====== */
+static gboolean descriptor_property_get_uuid(const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	char uuid[MAX_LEN_UUID_STR + 1];
+	const char *ptr = uuid;
+	struct gatt_dbus_descriptor *descr = data;
+
+	bt_uuid_to_string(&descr->uuid, uuid, sizeof(uuid));
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &ptr);
+
+	return TRUE;
+}
+
+static gboolean descriptor_property_get_chrc(const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct gatt_dbus_descriptor *descr = data;
+	const char *str = descr->chrc->path;
+
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_OBJECT_PATH, &str);
+
+	return TRUE;
+}
+
+static DBusMessage *descriptor_read_value(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	return btd_error_not_available(msg);
+}
+
+static DBusMessage *descriptor_write_value(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	return btd_error_not_available(msg);
+}
+
+static const GDBusMethodTable descriptor_methods[] = {
+	{ GDBUS_EXPERIMENTAL_ASYNC_METHOD("ReadValue", NULL,
+						GDBUS_ARGS({ "value", "ay" }),
+						descriptor_read_value) },
+	{ GDBUS_EXPERIMENTAL_ASYNC_METHOD("WriteValue",
+						GDBUS_ARGS({ "value", "ay" }),
+						NULL,
+						descriptor_write_value) },
+	{ }
+};
+
+static const GDBusPropertyTable descriptor_properties[] = {
+	{ "UUID", "s", descriptor_property_get_uuid, NULL, NULL,
+					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+	{ "Characteristic", "o", descriptor_property_get_chrc, NULL, NULL,
+					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+	{ }
+};
+
+static void cancel_pending_descr_requests(struct gatt_dbus_descriptor *descr)
+{
+	if (descr->read_request) {
+		DBG("Canceling pending descriptor read request");
+		g_attrib_cancel(descr->chrc->service->client->attrib,
+							descr->read_request);
+		descr->read_request = 0;
+	}
+
+	if (descr->write_request) {
+		DBG("Canceling pending descriptor write request");
+		g_attrib_cancel(descr->chrc->service->client->attrib,
+							descr->write_request);
+		descr->write_request = 0;
+	}
+}
+
+static void destroy_descr(gpointer user_data)
+{
+	struct gatt_dbus_descriptor *descr = user_data;
+
+	/*
+	 * This could have happened without going through unregister_descr.
+	 * Cancel pending requests.
+	 */
+	cancel_pending_descr_requests(descr);
+
+	DBG("Destroying GATT descriptor: %s", descr->path);
+
+	g_free(descr->path);
+	g_free(descr);
+}
+
+static void unregister_descr(gpointer user_data)
+{
+	struct gatt_dbus_descriptor *descr = user_data;
+
+	cancel_pending_descr_requests(descr);
+
+	DBG("Unregistering GATT descriptor: %s", descr->path);
+
+	g_dbus_unregister_interface(btd_get_dbus_connection(), descr->path,
+							GATT_DESCRIPTOR_IFACE);
+}
+
+static struct gatt_dbus_descriptor *gatt_dbus_descriptor_create(
+					struct gatt_dbus_characteristic *chrc,
+					struct gatt_desc *desc)
+{
+	struct gatt_dbus_descriptor *descr;
+	bt_uuid_t uuid;
+
+	descr = g_try_new0(struct gatt_dbus_descriptor, 1);
+	if (!descr)
+		return NULL;
+
+	descr->path = g_strdup_printf("%s/desc%04x", chrc->path, desc->handle);
+
+	descr->chrc = chrc;
+	descr->handle = desc->handle;
+
+	if (bt_string_to_uuid(&uuid, desc->uuid)) {
+		error("GATT descriptor has invalid UUID: %s", desc->uuid);
+		goto fail;
+	}
+
+	bt_uuid_to_uuid128(&uuid, &descr->uuid);
+
+	if (!g_dbus_register_interface(btd_get_dbus_connection(), descr->path,
+							GATT_DESCRIPTOR_IFACE,
+							descriptor_methods, NULL,
+							descriptor_properties,
+							descr, destroy_descr)) {
+		error("Failed to register GATT descriptor: UUID: %s",
+								desc->uuid);
+		goto fail;
+	}
+
+	DBG("GATT descriptor created: %s", descr->path);
+
+	return descr;
+
+fail:
+	destroy_descr(descr);
+	return NULL;
+}
+
 /* ====== Characteristic properties/methods ====== */
+static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
+								void *user_data)
+{
+	struct gatt_dbus_characteristic *chrc = user_data;
+	struct gatt_dbus_descriptor *descr;
+	struct gatt_desc *desc;
+	GSList *l;
+
+	chrc->desc_request = 0;
+
+	if (status)
+		return;
+
+	for (l = descs; l; l = g_slist_next(l)) {
+		desc = l->data;
+		descr = gatt_dbus_descriptor_create(chrc, desc);
+		if (!descr)
+			continue;
+
+		chrc->descriptors = g_slist_append(chrc->descriptors, descr);
+	}
+}
+
+static void characteristic_discover_descriptors(
+					struct gatt_dbus_characteristic *chrc,
+					uint16_t end_handle)
+{
+	if (chrc->desc_request)
+		return;
+
+	chrc->desc_request = gatt_discover_desc(chrc->service->client->attrib,
+						chrc->value_handle + 1,
+						end_handle, NULL,
+						gatt_discover_desc_cb, chrc);
+}
+
 static gboolean characteristic_property_get_uuid(
 					const GDBusPropertyTable *property,
 					DBusMessageIter *iter, void *data)
@@ -266,8 +459,9 @@ static DBusMessage *characteristic_read_value(DBusConnection *conn,
 	struct gatt_dbus_characteristic *chrc = user_data;
 	struct gatt_char_read_op *op;
 
-	if (!chrc->client->attrib)
-		return btd_error_failed("ATT data connection uninitialized");
+	if (!chrc->service->client->attrib)
+		return btd_error_failed(msg,
+					"ATT data connection uninitialized");
 
 	if (chrc->read_request)
 		return btd_error_in_progress(msg);
@@ -331,8 +525,9 @@ static DBusMessage *characteristic_write_value(DBusConnection *conn,
 	guint req;
 	DBusMessageIter iter, array;
 
-	if (!chrc->client->attrib)
-		return btd_error_failed("ATT data connection uninitialized");
+	if (!chrc->service->client->attrib)
+		return btd_error_failed(msg,
+					"ATT data connection uninitialized");
 
 	if (chrc->write_request)
 		return btd_error_in_progress(msg);
@@ -418,7 +613,7 @@ static const GDBusPropertyTable characteristic_properties[] = {
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
 	{ "Flags", "as", characteristic_property_get_flags, NULL, NULL,
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
-	{}
+	{ }
 };
 
 static void cancel_pending_chrc_requests(struct gatt_dbus_characteristic *chrc)
@@ -436,6 +631,13 @@ static void cancel_pending_chrc_requests(struct gatt_dbus_characteristic *chrc)
 							chrc->write_request);
 		chrc->write_request = 0;
 	}
+
+	if (chrc->desc_request) {
+		DBG("Canceling pending descriptor discovery request");
+		g_attrib_cancel(chrc->service->client->attrib,
+							chrc->desc_request);
+		chrc->desc_request = 0;
+	}
 }
 
 static void destroy_characteristic(gpointer user_data)
@@ -443,6 +645,15 @@ static void destroy_characteristic(gpointer user_data)
 	struct gatt_dbus_characteristic *chrc = user_data;
 
 	cancel_pending_chrc_requests(chrc);
+
+	/*
+	 * If this happened, and there are still descriptors lying around,
+	 * remove them. Also make sure all pending requests have been canceled.
+	 */
+	if (chrc->descriptors) {
+		g_slist_free_full(chrc->descriptors, unregister_descr);
+		chrc->descriptors = NULL;
+	}
 
 	DBG("Destroying GATT characteristic: %s", chrc->path);
 
@@ -456,6 +667,12 @@ static void unregister_characteristic(gpointer user_data)
 
 	cancel_pending_chrc_requests(chrc);
 
+	/* Remove descriptors before removing the characteristic */
+	if (chrc->descriptors) {
+		g_slist_free_full(chrc->descriptors, unregister_descr);
+		chrc->descriptors = NULL;
+	}
+
 	DBG("Unregistering GATT characteristic: %s", chrc->path);
 
 	g_dbus_unregister_interface(btd_get_dbus_connection(),
@@ -463,7 +680,7 @@ static void unregister_characteristic(gpointer user_data)
 						GATT_CHARACTERISTIC_IFACE);
 }
 
-struct gatt_dbus_characteristic *gatt_dbus_characteristic_create(
+static struct gatt_dbus_characteristic *gatt_dbus_characteristic_create(
 					struct gatt_dbus_service *service,
 					struct gatt_char *chr)
 {
@@ -517,9 +734,10 @@ static void gatt_discover_characteristics_cb(uint8_t status,
 							void *user_data)
 {
 	struct gatt_dbus_service *service = user_data;
-	struct gatt_dbus_characteristic *characteristic;
-	struct gatt_char *chr;
-	GSList *l;
+	struct gatt_dbus_characteristic *chrc;
+	struct gatt_char *chr, *next_chr;
+	uint16_t end_handle;
+	GSList *l, *next;
 
 	DBG("GATT characteristic discovery status: %u", status);
 
@@ -530,13 +748,23 @@ static void gatt_discover_characteristics_cb(uint8_t status,
 
 	for (l = characteristics; l; l = g_slist_next(l)) {
 		chr = l->data;
-		characteristic = gatt_dbus_characteristic_create(service, chr);
-		if (!characteristic)
+		chrc = gatt_dbus_characteristic_create(service, chr);
+		if (!chrc)
 			continue;
 
 		service->characteristics = g_slist_append(
 						service->characteristics,
-						characteristic);
+						chrc);
+
+		next = g_slist_next(l);
+		if (next) {
+			next_chr = next->data;
+			end_handle = next_chr->handle - 1;
+		} else
+			end_handle = service->handle_range.end;
+
+		/* Discover the desriptors */
+		characteristic_discover_descriptors(chrc, end_handle);
 	}
 
 	service->characteristics_discovered = true;
@@ -803,6 +1031,8 @@ static void attio_disconnect_cb(gpointer user_data)
 
 	attio_cleanup(client);
 
+	g_slist_free_full(client->services, unregister_service);
+	client->services = 0;
 	client->initialized = false;
 }
 
