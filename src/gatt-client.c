@@ -180,10 +180,85 @@ static gboolean descriptor_property_get_chrc(const GDBusPropertyTable *property,
 	return TRUE;
 }
 
+struct gatt_desc_read_op {
+	struct gatt_dbus_descriptor *desc;
+	DBusMessage *msg;
+};
+
+static void read_desc_cb(guint8 status, const guint8 *pdu, guint16 len,
+							gpointer user_data)
+{
+	struct gatt_desc_read_op *op = user_data;
+	uint8_t value[len];
+	ssize_t vlen;
+	DBusMessageIter iter, array;
+	DBusMessage *reply;
+	int i;
+
+	if (status) {
+		reply = error_from_att_ecode(op->msg, status);
+		goto done;
+	}
+
+	vlen = dec_read_resp(pdu, len, value, sizeof(value));
+	if (vlen < 0) {
+		reply = btd_error_failed(op->msg, "Invalid response received");
+		goto done;
+	}
+
+	reply = g_dbus_create_reply(op->msg, DBUS_TYPE_INVALID);
+	if (!reply)
+		goto fail;
+
+	dbus_message_iter_init_append(reply, &iter);
+	dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "y", &array);
+
+	for (i = 0; i < vlen; i++)
+		dbus_message_iter_append_basic(&array, DBUS_TYPE_BYTE,
+								value + i);
+
+	dbus_message_iter_close_container(&iter, &array);
+
+done:
+	g_dbus_send_message(btd_get_dbus_connection(), reply);
+
+fail:
+	dbus_message_unref(op->msg);
+	op->desc->read_request = 0;
+	g_free(op);
+}
+
 static DBusMessage *descriptor_read_value(DBusConnection *conn,
 					DBusMessage *msg, void *user_data)
 {
-	return btd_error_not_available(msg);
+	struct gatt_dbus_descriptor *desc = user_data;
+	struct gatt_desc_read_op *op;
+	GAttrib *attrib = desc->chrc->service->client->attrib;
+
+	if (!attrib)
+		return btd_error_failed(msg,
+					"ATT data connection uninitialized");
+
+	if (desc->read_request)
+		return btd_error_in_progress(msg);
+
+	op = g_try_new0(struct gatt_desc_read_op, 1);
+	if (!op)
+		return btd_error_failed(msg, "Failed to initialize request");
+
+	op->desc = desc;
+	op->msg = msg;
+
+	desc->read_request = gatt_read_char(attrib, desc->handle,
+							read_desc_cb, op);
+	if (!desc->read_request) {
+		g_free(op);
+		return btd_error_failed(msg, "Failed to issue request");
+	}
+
+	dbus_message_ref(msg);
+
+	return NULL;
 }
 
 static DBusMessage *descriptor_write_value(DBusConnection *conn,
