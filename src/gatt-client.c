@@ -26,7 +26,6 @@
 #endif
 
 #include <stdbool.h>
-
 #include <stdint.h>
 
 #include <glib.h>
@@ -43,6 +42,7 @@
 #include "attrib/gattrib.h"
 #include "attrib/gatt.h"
 #include "log.h"
+#include "src/shared/util.h"
 
 #define GATT_SERVICE_IFACE		"org.bluez.GattService1"
 #define GATT_CHARACTERISTIC_IFACE	"org.bluez.GattCharacteristic1"
@@ -85,6 +85,9 @@ struct gatt_dbus_characteristic {
 	guint read_request;
 	guint write_request;
 	guint desc_request;
+
+	guint not_id;
+	guint ind_id;
 
 	GSList *descriptors;
 };
@@ -296,6 +299,84 @@ fail:
 }
 
 /* ====== Characteristic properties/methods ====== */
+static void characteristic_not_cb(const uint8_t *pdu, uint16_t len,
+							gpointer user_data)
+{
+	struct gatt_dbus_characteristic *chrc = user_data;
+	uint16_t handle, olen;
+	uint8_t *opdu;
+	const uint8_t *value;
+	size_t plen;
+	bool ind = false;
+
+	if (len < 3) {
+		error("Received malformed notification/indication PDU");
+		return;
+	}
+
+	handle = get_le16(&pdu[1]);
+	DBG("Characterstic notification/indication received for handle: 0x%04x",
+									handle);
+	if (handle != chrc->value_handle)
+		return;
+
+	if (pdu[0] == ATT_OP_HANDLE_IND)
+		ind = true;
+	else if (pdu[0] != ATT_OP_HANDLE_NOTIFY)
+		return;
+
+	value = pdu + 3;
+
+	if (!g_dbus_emit_signal(btd_get_dbus_connection(), chrc->path,
+						GATT_CHARACTERISTIC_IFACE,
+						"ValueUpdated",
+						DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE,
+						&value, len - 3,
+						DBUS_TYPE_INVALID))
+		DBG("Failed to emit ValueUpdated signal");
+
+	if (!ind)
+		return;
+
+	opdu = g_attrib_get_buffer(chrc->service->client->attrib, &plen);
+	olen = enc_confirmation(opdu, plen);
+	if (olen > 0)
+		g_attrib_send(chrc->service->client->attrib, 0, opdu, olen,
+							NULL, NULL, NULL);
+}
+
+static void ccc_written_cb(guint8 status, const guint8 *pdu, guint16 plen,
+							gpointer user_data)
+{
+	struct gatt_dbus_descriptor *descr = user_data;
+	struct gatt_dbus_characteristic *chrc = descr->chrc;
+
+	descr->write_request = 0;
+
+	if (status) {
+		error("Failed to enable notifications/indications for "
+					"characteristic: %s", chrc->path);
+		return;
+	}
+
+	DBG("Notifications/indications enabled for characteristic: %s",
+								chrc->path);
+
+	if (chrc->properties & GATT_CHR_PROP_NOTIFY)
+		chrc->not_id = g_attrib_register(chrc->service->client->attrib,
+							ATT_OP_HANDLE_NOTIFY,
+							chrc->value_handle,
+							characteristic_not_cb,
+							chrc, NULL);
+
+	if (chrc->properties & GATT_CHR_PROP_INDICATE)
+		chrc->ind_id = g_attrib_register(chrc->service->client->attrib,
+							ATT_OP_HANDLE_IND,
+							chrc->value_handle,
+							characteristic_not_cb,
+							chrc, NULL);
+}
+
 static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 								void *user_data)
 {
@@ -316,6 +397,40 @@ static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 			continue;
 
 		chrc->descriptors = g_slist_append(chrc->descriptors, descr);
+
+		/*
+		 * If this is the Client Characteristic Configuration
+		 * descriptor, try to enable indications/notifications.
+		 * TODO: This might fail due to insufficient security if the
+		 * device was not paired. In that case, we need a way to retry
+		 * when the security level of the conneciton is raised.
+		 */
+		if (desc->uuid16 == GATT_CLIENT_CHARAC_CFG_UUID) {
+			uint8_t value_buf[2];
+			uint16_t value = 0;
+
+			if (chrc->properties & GATT_CHR_PROP_NOTIFY)
+				value |= GATT_CLIENT_CHARAC_CFG_NOTIF_BIT;
+			if (chrc->properties & GATT_CHR_PROP_INDICATE)
+				value |= GATT_CLIENT_CHARAC_CFG_IND_BIT;
+
+			if (value) {
+				put_le16(value, value_buf);
+				descr->write_request = gatt_write_char(
+						chrc->service->client->attrib,
+						descr->handle,
+						value_buf,
+						sizeof(value_buf),
+						ccc_written_cb, descr);
+
+				if (!chrc->write_request)
+					error("Failed to enable notifications/"
+						"indications for GATT "
+						"characteristic: %s", chrc->path);
+			}
+		}
+
+		/* TODO: Handle Characteristic Extended Properties descriptor */
 	}
 }
 
@@ -637,6 +752,20 @@ static void cancel_pending_chrc_requests(struct gatt_dbus_characteristic *chrc)
 		g_attrib_cancel(chrc->service->client->attrib,
 							chrc->desc_request);
 		chrc->desc_request = 0;
+	}
+
+	if (chrc->not_id) {
+		DBG("Canceling registered notifications");
+		g_attrib_unregister(chrc->service->client->attrib,
+								chrc->not_id);
+		chrc->not_id = 0;
+	}
+
+	if (chrc->ind_id) {
+		DBG("Canceling registered indications");
+		g_attrib_unregister(chrc->service->client->attrib,
+								chrc->ind_id);
+		chrc->ind_id = 0;
 	}
 }
 
@@ -1031,8 +1160,6 @@ static void attio_disconnect_cb(gpointer user_data)
 
 	attio_cleanup(client);
 
-	g_slist_free_full(client->services, unregister_service);
-	client->services = 0;
 	client->initialized = false;
 }
 
