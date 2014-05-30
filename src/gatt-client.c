@@ -261,10 +261,94 @@ static DBusMessage *descriptor_read_value(DBusConnection *conn,
 	return NULL;
 }
 
+struct gatt_desc_write_op {
+	struct gatt_dbus_descriptor *desc;
+	DBusMessage *msg;
+};
+
+static void write_desc_cb(guint8 status, const guint8 *pdu, guint16 len,
+							gpointer user_data)
+{
+	struct gatt_desc_write_op *op = user_data;
+	DBusMessage *reply;
+
+	if (status) {
+		reply = error_from_att_ecode(op->msg, status);
+		goto done;
+	}
+
+	reply = g_dbus_create_reply(op->msg, DBUS_TYPE_INVALID);
+	if (!reply)
+		goto fail;
+
+done:
+	g_dbus_send_message(btd_get_dbus_connection(), reply);
+
+fail:
+	dbus_message_unref(op->msg);
+	op->desc->write_request = 0;
+	g_free(op);
+}
+
 static DBusMessage *descriptor_write_value(DBusConnection *conn,
 					DBusMessage *msg, void *user_data)
 {
-	return btd_error_not_available(msg);
+	struct gatt_dbus_descriptor *desc = user_data;
+	struct gatt_desc_write_op *op = NULL;
+	uint8_t *value = NULL;
+	int vlen = 0;
+	GAttrib *attrib = desc->chrc->service->client->attrib;
+	DBusMessageIter iter, array;
+	bt_uuid_t uuid;
+
+	if (!attrib)
+		return btd_error_failed(msg,
+					"ATT data connection uninitialized");
+
+	if (desc->write_request)
+		return btd_error_in_progress(msg);
+
+	if (!dbus_message_iter_init(msg, &iter))
+		return btd_error_invalid_args(msg);
+
+	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY)
+		return btd_error_invalid_args(msg);
+
+	dbus_message_iter_recurse(&iter, &array);
+	dbus_message_iter_get_fixed_array(&array, &value, &vlen);
+	dbus_message_iter_next(&iter);
+
+	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_INVALID)
+		return btd_error_invalid_args(msg);
+
+	/*
+	 * Since we explicitly enable notifications and indications, don't
+	 * allow writing to the "Client Characteristic Configuration"
+	 * descriptor.
+	 */
+	bt_uuid16_create(&uuid, GATT_CLIENT_CHARAC_CFG_UUID);
+	if (bt_uuid_cmp(&uuid, &desc->uuid) == 0)
+		return btd_error_failed(msg, "Writing to the \"Client "
+						"Characteristic Configuration\""
+						"descriptor not allowed");
+
+	op = g_try_new0(struct gatt_desc_write_op, 1);
+	if (!op)
+		return btd_error_failed(msg, "Failed to initialize request");
+
+	op->desc = desc;
+	op->msg = msg;
+
+	desc->write_request = gatt_write_char(attrib, desc->handle, value, vlen,
+							write_desc_cb, op);
+	if (!desc->write_request) {
+		g_free(op);
+		return btd_error_failed(msg, "Failed to issue request");
+	}
+
+	dbus_message_ref(msg);
+
+	return NULL;
 }
 
 static const GDBusMethodTable descriptor_methods[] = {
