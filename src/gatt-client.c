@@ -155,6 +155,40 @@ static DBusMessage *error_from_att_ecode(DBusMessage *msg, guint8 ecode)
 	return NULL;
 }
 
+static void discover_primary_cb(uint8_t status, GSList *services,
+							void *user_data);
+static void unregister_service(gpointer user_data);
+
+static void gatt_client_initialize_services(struct btd_gatt_client *client)
+{
+	if (client->initialized)
+		return;
+
+	if (client->request)
+		return;
+
+	client->request = gatt_discover_primary(client->attrib, NULL,
+						discover_primary_cb, client);
+	if (!client->request)
+		error("Failed to start GATT service discovery for device: %s",
+					device_get_path(client->device));
+}
+
+static void gatt_client_uninitialize_services(struct btd_gatt_client *client)
+{
+	if (client->request) {
+		g_attrib_cancel(client->attrib, client->request);
+		client->request = 0;
+	}
+
+	if (client->services) {
+		g_slist_free_full(client->services, unregister_service);
+		client->services = NULL;
+	}
+
+	client->initialized = false;
+}
+
 /* ====== Descriptor properties/methods ====== */
 static gboolean descriptor_property_get_uuid(const GDBusPropertyTable *property,
 					DBusMessageIter *iter, void *data)
@@ -458,6 +492,40 @@ fail:
 }
 
 /* ====== Characteristic properties/methods ====== */
+static void handle_service_changed_event(const uint8_t *value, uint16_t len,
+						struct btd_gatt_client *client)
+{
+	uint16_t start, end;
+	uint8_t bdaddr_type;
+	GSList *l;
+
+	if (len != 4) {
+		error("Received malformed indication from Service Changed "
+							"characteristic");
+		return;
+	}
+
+	start = get_le16(&value[0]);
+	end = get_le16(&value[2]);
+
+	DBG("Service Changed indication: start: 0x%04x, end: 0x%04x",
+								start, end);
+
+	bdaddr_type = btd_device_get_bdaddr_type(client->device);
+	if (!device_is_bonded(client->device, bdaddr_type)) {
+		DBG("Device is not bonded; ignoring Service Changed");
+		return;
+	}
+
+	/*
+	 * Be lazy and reinitialize all services here
+	 * TODO: Once the database is integrated, only rediscover the affected
+	 * handles.
+	 */
+	gatt_client_uninitialize_services(client);
+	gatt_client_initialize_services(client);
+}
+
 static void characteristic_not_cb(const uint8_t *pdu, uint16_t len,
 							gpointer user_data)
 {
@@ -467,6 +535,7 @@ static void characteristic_not_cb(const uint8_t *pdu, uint16_t len,
 	const uint8_t *value;
 	size_t plen;
 	bool ind = false;
+	bt_uuid_t svc_changed;
 
 	if (len < 3) {
 		error("Received malformed notification/indication PDU");
@@ -502,6 +571,12 @@ static void characteristic_not_cb(const uint8_t *pdu, uint16_t len,
 	if (olen > 0)
 		g_attrib_send(chrc->service->client->attrib, 0, opdu, olen,
 							NULL, NULL, NULL);
+
+	/* Handle "Service Changed" characteristic. */
+	bt_uuid16_create(&svc_changed, GATT_CHARAC_SERVICE_CHANGED);
+	if (bt_uuid_cmp(&svc_changed, &chrc->uuid) == 0)
+		handle_service_changed_event(value, len - 3,
+							chrc->service->client);
 }
 
 static void ccc_written_cb(guint8 status, const guint8 *pdu, guint16 plen,
@@ -1280,24 +1355,18 @@ static void attio_connect_cb(GAttrib *attrib, gpointer user_data)
 
 	client->attrib = g_attrib_ref(attrib);
 
-	/* TODO: Discover remote GATT services here and mark as "initialized".
+	/*
+	 * Discover remote GATT services here and mark as "initialized".
 	 * Once initialized, we will only re-discover all services here if the
 	 * device is not bonded. Otherwise, we will only rediscover when we
 	 * receive an indication from the Service Changed Characteristic.
+	 *
+	 * TODO: For now, we always rediscover all services. Change this
+	 * behavior once src/shared/gatt-db is integrated.
 	 */
 	info("btd_gatt_client: device connected. Initializing GATT services\n");
 
-	if (client->initialized)
-		return;
-
-	if (client->request)
-		return;
-
-	client->request = gatt_discover_primary(client->attrib, NULL,
-						discover_primary_cb, client);
-	if (!client->request)
-		error("Failed to start GATT service discovery for device: %s",
-					device_get_path(client->device));
+	gatt_client_initialize_services(client);
 }
 
 static void attio_disconnect_cb(gpointer user_data)
@@ -1307,19 +1376,9 @@ static void attio_disconnect_cb(gpointer user_data)
 	info("btd_gatt_client: device disconnected. Cleaning up GATT "
 								"services\n");
 
-	if (client->request) {
-		g_attrib_cancel(client->attrib, client->request);
-		client->request = 0;
-	}
-
-	if (client->services) {
-		g_slist_free_full(client->services, unregister_service);
-		client->services = NULL;
-	}
+	gatt_client_uninitialize_services(client);
 
 	attio_cleanup(client);
-
-	client->initialized = false;
 }
 
 struct btd_gatt_client *btd_gatt_client_new(struct btd_device *device)
@@ -1351,15 +1410,7 @@ void btd_gatt_client_destroy(struct btd_gatt_client *client)
 		btd_device_remove_attio_callback(client->device,
 							client->attioid);
 
-	if (client->request) {
-		g_attrib_cancel(client->attrib, client->request);
-		client->request = 0;
-	}
-
-	if (client->services) {
-		g_slist_free_full(client->services, unregister_service);
-		client->services = NULL;
-	}
+	gatt_client_uninitialize_services(client);
 
 	attio_cleanup(client);
 
