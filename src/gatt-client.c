@@ -51,6 +51,8 @@
 #define GATT_CHR_EXT_PROP_RELIABLE_WRITE	0x01
 #define GATT_CHR_EXT_PROP_WRITABLE_AUX		0x02
 
+#define HOG_UUID	0x1812
+
 struct btd_gatt_client {
 	struct btd_device *device;
 	GAttrib *attrib;
@@ -1307,6 +1309,7 @@ static struct gatt_dbus_service *gatt_dbus_service_create(
 {
 	struct gatt_dbus_service *service;
 	bt_uuid_t uuid;
+	bt_uuid_t hid_uuid;
 	const char *device_path = device_get_path(client->device);
 
 	service = g_try_new0(struct gatt_dbus_service, 1);
@@ -1324,6 +1327,18 @@ static struct gatt_dbus_service *gatt_dbus_service_create(
 	}
 
 	bt_uuid_to_uuid128(&uuid, &service->uuid);
+
+	/* Don't expose the HID service, since it generates too much
+	 * noise.
+	 *
+	 * TODO(armansito): Remove this once we have an API for enabling
+	 * notifications
+	 */
+	bt_uuid16_create(&hid_uuid, HOG_UUID);
+	if (bt_uuid_cmp(&hid_uuid, &service->uuid) == 0) {
+		error("HID GATT service blacklisted");
+		goto fail;
+	}
 
 	if (!g_dbus_register_interface(btd_get_dbus_connection(), service->path,
 						GATT_SERVICE_IFACE,
