@@ -48,6 +48,9 @@
 #define GATT_CHARACTERISTIC_IFACE	"org.bluez.GattCharacteristic1"
 #define GATT_DESCRIPTOR_IFACE		"org.bluez.GattDescriptor1"
 
+#define GATT_CHR_EXT_PROP_RELIABLE_WRITE	0x01
+#define GATT_CHR_EXT_PROP_WRITABLE_AUX		0x02
+
 struct btd_gatt_client {
 	struct btd_device *device;
 	GAttrib *attrib;
@@ -80,6 +83,7 @@ struct gatt_dbus_characteristic {
 	uint16_t handle;
 	uint16_t value_handle;
 	uint8_t properties;
+	uint16_t ext_properties;
 	char *path;
 
 	guint read_request;
@@ -611,6 +615,38 @@ static void ccc_written_cb(guint8 status, const guint8 *pdu, guint16 plen,
 							chrc, NULL);
 }
 
+static void read_ext_props_cb(guint8 status, const guint8 *pdu, guint16 len,
+							gpointer user_data)
+{
+	struct gatt_dbus_descriptor *descr = user_data;
+	struct gatt_dbus_characteristic *chrc = descr->chrc;
+	uint8_t value[len];
+	ssize_t vlen;
+
+	descr->read_request = 0;
+
+	if (status)
+		goto fail;
+
+	vlen = dec_read_resp(pdu, len, value, sizeof(value));
+	if (vlen != 2)
+		goto fail;
+
+	chrc->ext_properties = get_le16(value);
+
+	if (chrc->ext_properties)
+		g_dbus_emit_property_changed(btd_get_dbus_connection(),
+						chrc->path,
+						GATT_CHARACTERISTIC_IFACE,
+						"Flags");
+
+	return;
+
+fail:
+	error("Failed to read extended properties for GATT "
+					"characteristic: %s", chrc->path);
+}
+
 static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 								void *user_data)
 {
@@ -664,7 +700,17 @@ static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 			}
 		}
 
-		/* TODO: Handle Characteristic Extended Properties descriptor */
+		/* Handle Characteristic Extended Properties descriptor */
+		if (desc->uuid16 == GATT_CHARAC_EXT_PROPER_UUID) {
+			descr->read_request = gatt_read_char(
+						chrc->service->client->attrib,
+						desc->handle,
+						read_ext_props_cb, descr);
+			if (!descr->read_request)
+				error("Failed to send request to read extended "
+					"properties for GATT "
+					"characteristic: %s", chrc->path);
+		}
 	}
 }
 
@@ -711,9 +757,10 @@ static gboolean characteristic_property_get_flags(
 					const GDBusPropertyTable *property,
 					DBusMessageIter *iter, void *data)
 {
-	struct gatt_dbus_characteristic *characteristic = data;
+	struct gatt_dbus_characteristic *chrc = data;
 	DBusMessageIter array;
 	const int num_flags = 8;
+	const int num_ext_flags = 2;
 	int i;
 	const uint8_t props[] = {
 		GATT_CHR_PROP_BROADCAST,
@@ -736,18 +783,31 @@ static gboolean characteristic_property_get_flags(
 		"extended-properties"
 	};
 
+	const uint8_t ext_props[] = {
+		GATT_CHR_EXT_PROP_RELIABLE_WRITE,
+		GATT_CHR_EXT_PROP_WRITABLE_AUX
+	};
+	const char *ext_flags[] = {
+		"reliable-write",
+		"writable-auxiliaries"
+	};
+
 	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "s", &array);
 
 	for (i = 0; i < num_flags; i++) {
-		if (characteristic->properties & props[i])
+		if (chrc->properties & props[i])
 			dbus_message_iter_append_basic(&array, DBUS_TYPE_STRING,
 								&flags[i]);
 	}
 
-	/*
-	 * TODO: include the extended properties here if the descriptor is
-	 * present.
-	 */
+	if (chrc->properties & GATT_CHR_PROP_EXT_PROP) {
+		for (i = 0; i < num_ext_flags; i++) {
+			if (chrc->ext_properties & ext_props[i])
+				dbus_message_iter_append_basic(&array,
+							DBUS_TYPE_STRING,
+							&ext_flags[i]);
+		}
+	}
 
 	dbus_message_iter_close_container(iter, &array);
 
