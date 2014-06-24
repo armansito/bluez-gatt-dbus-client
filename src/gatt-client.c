@@ -96,6 +96,11 @@ struct gatt_dbus_characteristic {
 	guint ind_id;
 
 	GSList *descriptors;
+
+	bool notifying;
+	GSList *notify_list;  /* list of notification clients */
+	uint16_t ccc_handle;
+	guint ccc_write_req;
 };
 
 struct gatt_dbus_descriptor {
@@ -361,9 +366,7 @@ static DBusMessage *descriptor_write_value(DBusConnection *conn,
 	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_INVALID)
 		return btd_error_invalid_args(msg);
 
-	/*
-	 * Since we explicitly enable notifications and indications, don't
-	 * allow writing to the "Client Characteristic Configuration"
+	/* Don't allow writing to the "Client Characteristic Configuration"
 	 * descriptor.
 	 */
 	bt_uuid16_create(&uuid, GATT_CLIENT_CHARAC_CFG_UUID);
@@ -581,38 +584,6 @@ static void characteristic_not_cb(const uint8_t *pdu, uint16_t len,
 							chrc->service->client);
 }
 
-static void ccc_written_cb(guint8 status, const guint8 *pdu, guint16 plen,
-							gpointer user_data)
-{
-	struct gatt_dbus_descriptor *descr = user_data;
-	struct gatt_dbus_characteristic *chrc = descr->chrc;
-
-	descr->write_request = 0;
-
-	if (status) {
-		error("Failed to enable notifications/indications for "
-					"characteristic: %s", chrc->path);
-		return;
-	}
-
-	DBG("Notifications/indications enabled for characteristic: %s",
-								chrc->path);
-
-	if (chrc->properties & GATT_CHR_PROP_NOTIFY)
-		chrc->not_id = g_attrib_register(chrc->service->client->attrib,
-							ATT_OP_HANDLE_NOTIFY,
-							chrc->value_handle,
-							characteristic_not_cb,
-							chrc, NULL);
-
-	if (chrc->properties & GATT_CHR_PROP_INDICATE)
-		chrc->ind_id = g_attrib_register(chrc->service->client->attrib,
-							ATT_OP_HANDLE_IND,
-							chrc->value_handle,
-							characteristic_not_cb,
-							chrc, NULL);
-}
-
 static void read_ext_props_cb(guint8 status, const guint8 *pdu, guint16 len,
 							gpointer user_data)
 {
@@ -668,35 +639,15 @@ static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 
 		/*
 		 * If this is the Client Characteristic Configuration
-		 * descriptor, try to enable indications/notifications.
-		 * TODO: This might fail due to insufficient security if the
-		 * device was not paired. In that case, we need a way to retry
-		 * when the security level of the conneciton is raised.
+		 * descriptor, store the handle so that it can be used to
+		 * enable notifications/indications later.
+		 *
+		 * Note: No need to enable notifications for the Service
+		 * Changed characteristic, since the GAS plugin automatically
+		 * handles that.
 		 */
-		if (desc->uuid16 == GATT_CLIENT_CHARAC_CFG_UUID) {
-			uint8_t value_buf[2];
-			uint16_t value = 0;
-
-			if (chrc->properties & GATT_CHR_PROP_NOTIFY)
-				value |= GATT_CLIENT_CHARAC_CFG_NOTIF_BIT;
-			if (chrc->properties & GATT_CHR_PROP_INDICATE)
-				value |= GATT_CLIENT_CHARAC_CFG_IND_BIT;
-
-			if (value) {
-				put_le16(value, value_buf);
-				descr->write_request = gatt_write_char(
-						chrc->service->client->attrib,
-						descr->handle,
-						value_buf,
-						sizeof(value_buf),
-						ccc_written_cb, descr);
-
-				if (!chrc->write_request)
-					error("Failed to enable notifications/"
-						"indications for GATT "
-						"characteristic: %s", chrc->path);
-			}
-		}
+		if (desc->uuid16 == GATT_CLIENT_CHARAC_CFG_UUID)
+			chrc->ccc_handle = descr->handle;
 
 		/* Handle Characteristic Extended Properties descriptor */
 		if (desc->uuid16 == GATT_CHARAC_EXT_PROPER_UUID) {
@@ -747,6 +698,18 @@ static gboolean characteristic_property_get_service(
 	const char *str = characteristic->service->path;
 
 	dbus_message_iter_append_basic(iter, DBUS_TYPE_OBJECT_PATH, &str);
+
+	return TRUE;
+}
+
+static gboolean characteristic_property_get_notifying(
+					const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct gatt_dbus_characteristic *characteristic = data;
+	dbus_bool_t notifying = characteristic->notifying;
+
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_BOOLEAN, &notifying);
 
 	return TRUE;
 }
@@ -997,12 +960,278 @@ static DBusMessage *characteristic_write_value(DBusConnection *conn,
 	return dbus_message_new_method_return(msg);
 }
 
+struct watch_client {
+	struct gatt_dbus_characteristic *chrc;
+	char *owner;
+	guint watch;
+};
+
+static int compare_sender(gconstpointer a, gconstpointer b)
+{
+	const struct watch_client *client = a;
+	const char *sender = b;
+
+	return g_strcmp0(client->owner, sender);
+}
+
+static void notify_cleanup(struct gatt_dbus_characteristic *chrc)
+{
+	uint8_t buf[2];
+
+	if (chrc->not_id) {
+		DBG("Canceling registered notifications");
+		g_attrib_unregister(chrc->service->client->attrib,
+								chrc->not_id);
+		chrc->not_id = 0;
+	}
+
+	if (chrc->ind_id) {
+		DBG("Canceling registered indications");
+		g_attrib_unregister(chrc->service->client->attrib,
+								chrc->ind_id);
+		chrc->ind_id = 0;
+	}
+
+	if (!chrc->notifying)
+		return;
+
+	if (chrc->ccc_write_req) {
+		g_attrib_cancel(chrc->service->client->attrib,
+						chrc->ccc_write_req);
+		chrc->ccc_write_req = 0;
+	}
+
+	memset(buf, 0, sizeof(buf));
+
+	gatt_write_char(chrc->service->client->attrib, chrc->ccc_handle, buf,
+								sizeof(buf),
+								NULL, NULL);
+
+	chrc->notifying = false;
+	g_dbus_emit_property_changed(btd_get_dbus_connection(),
+						chrc->path,
+						GATT_CHARACTERISTIC_IFACE,
+						"Notifying");
+}
+
+static void notify_disconnect(DBusConnection *conn, void *user_data)
+{
+	struct watch_client *client = user_data;
+	struct gatt_dbus_characteristic *chrc = client->chrc;
+
+	DBG("owner %s", client->owner);
+
+	chrc->notify_list = g_slist_remove(chrc->notify_list, client);
+
+	/*
+	 * There is no need for extra cleanup of the client since that will be
+	 * done by the destroy callback.
+	 *
+	 * However in case this is the last client, notifications and
+	 * indications need to be disabled.
+	 */
+	if (chrc->notify_list)
+		return;
+
+	notify_cleanup(chrc);
+}
+
+static void notify_destroy(void *user_data)
+{
+	struct watch_client *client = user_data;
+	struct gatt_dbus_characteristic *chrc = client->chrc;
+
+	DBG("owner %s", client->owner);
+
+	chrc->notify_list = g_slist_remove(chrc->notify_list, client);
+
+	g_free(client->owner);
+	g_free(client);
+}
+
+struct set_notify_op {
+	struct gatt_dbus_characteristic *chrc;
+	DBusMessage *msg;
+};
+
+static void notify_enable_cb(guint8 status, const guint8 *pdu, guint16 plen,
+							gpointer user_data)
+{
+	struct set_notify_op *op = user_data;
+	struct gatt_dbus_characteristic *chrc = op->chrc;
+	DBusMessage *reply;
+
+	if (status) {
+		error("Failed to enable notifications/indications for "
+					"characteristic: %s", chrc->path);
+		reply = error_from_att_ecode(op->msg, status);
+		goto done;
+	}
+
+	reply = dbus_message_new_method_return(op->msg);
+	if (!reply)
+		goto fail;
+
+	if (chrc->notifying)
+		goto done;
+
+	chrc->notifying = true;
+	g_dbus_emit_property_changed(btd_get_dbus_connection(),
+					chrc->path,
+					GATT_CHARACTERISTIC_IFACE,
+					"Notifying");
+
+	if (chrc->properties & GATT_CHR_PROP_NOTIFY)
+		chrc->not_id = g_attrib_register(chrc->service->client->attrib,
+							ATT_OP_HANDLE_NOTIFY,
+							chrc->value_handle,
+							characteristic_not_cb,
+							chrc, NULL);
+
+	if (chrc->properties & GATT_CHR_PROP_INDICATE)
+		chrc->ind_id = g_attrib_register(chrc->service->client->attrib,
+							ATT_OP_HANDLE_IND,
+							chrc->value_handle,
+							characteristic_not_cb,
+							chrc, NULL);
+
+done:
+	g_dbus_send_message(btd_get_dbus_connection(), reply);
+
+fail:
+	dbus_message_unref(op->msg);
+	chrc->ccc_write_req = 0;
+	g_free(op);
+}
+
+static DBusMessage *characteristic_start_notify(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	struct gatt_dbus_characteristic *chrc = user_data;
+	const char *sender = dbus_message_get_sender(msg);
+	struct set_notify_op *op = NULL;
+	struct watch_client *client;
+	uint8_t value_buf[2];
+	uint16_t value = 0;
+	bt_uuid_t svc_changed;
+	GSList *list;
+
+	DBG("characteristic: %s, sender: %s", chrc->path, sender);
+
+	if (!chrc->service->client->attrib)
+		return btd_error_failed(msg,
+					"ATT data connection uninitialized");
+
+	if (!chrc->ccc_handle || !(chrc->properties & GATT_CHR_PROP_NOTIFY ||
+				chrc->properties & GATT_CHR_PROP_INDICATE))
+		return btd_error_not_supported(msg);
+
+	bt_uuid16_create(&svc_changed, GATT_CHARAC_SERVICE_CHANGED);
+	if (bt_uuid_cmp(&svc_changed, &chrc->uuid) == 0)
+		return g_dbus_create_error(msg, ERROR_INTERFACE ".NotPermitted",
+						"Operation not permitted on "
+						"this characteristic");
+
+	/*
+	 * Every client can only start one notify session. If the client already
+	 * started a session, then return an error.
+	 */
+	list = g_slist_find_custom(chrc->notify_list, sender, compare_sender);
+	if (list)
+		return btd_error_busy(msg);
+
+	client = g_new0(struct watch_client, 1);
+	if (!client)
+		return btd_error_failed(msg, "Failed to allocate watch client");
+
+	client->chrc = chrc;
+	client->owner = g_strdup(sender);
+	client->watch = g_dbus_add_disconnect_watch(btd_get_dbus_connection(),
+						sender, notify_disconnect,
+						client, notify_destroy);
+
+	chrc->notify_list = g_slist_prepend(chrc->notify_list, client);
+
+	if (chrc->notifying)
+		return dbus_message_new_method_return(msg);
+
+	op = g_try_new0(struct set_notify_op, 1);
+	if (!op) {
+		g_dbus_remove_watch(btd_get_dbus_connection(), client->watch);
+		return btd_error_failed(msg, "Failed to enable notifications");
+	}
+
+	op->chrc = chrc;
+	op->msg = msg;
+
+	/* Send a request to enable notifications */
+	if (chrc->properties & GATT_CHR_PROP_NOTIFY)
+		value |= GATT_CLIENT_CHARAC_CFG_NOTIF_BIT;
+	if (chrc->properties & GATT_CHR_PROP_INDICATE)
+		value |= GATT_CLIENT_CHARAC_CFG_IND_BIT;
+
+	put_le16(value, value_buf);
+	chrc->ccc_write_req = gatt_write_char(
+					chrc->service->client->attrib,
+					chrc->ccc_handle, value_buf,
+					sizeof(value_buf), notify_enable_cb,
+					op);
+
+	if (!chrc->ccc_write_req) {
+		g_free(op);
+		g_dbus_remove_watch(btd_get_dbus_connection(), client->watch);
+		return btd_error_failed(msg, "Failed to enable notifications");
+	}
+
+	dbus_message_ref(msg);
+	return NULL;
+}
+
+static DBusMessage *characteristic_stop_notify(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	struct gatt_dbus_characteristic *chrc = user_data;
+	const char *sender = dbus_message_get_sender(msg);
+	struct watch_client *client;
+	GSList *list;
+
+	DBG("sender %s", sender);
+
+	if (!chrc->notifying)
+		return btd_error_failed(msg, "Not notifying");
+
+	list = g_slist_find_custom(chrc->notify_list, sender, compare_sender);
+	if (!list)
+		return btd_error_failed(msg, "No notify session started");
+
+	client = list->data;
+
+	/* The destroy function will cleanup the client information and also
+	 * remove it from the list of notify clients.
+	 */
+	g_dbus_remove_watch(btd_get_dbus_connection(), client->watch);
+
+	/* As long as other notify clients are still active, just return
+	 * success.
+	 */
+	if (chrc->notify_list)
+		return dbus_message_new_method_return(msg);
+
+	/* Cancel notifications and return success */
+	notify_cleanup(chrc);
+
+	return dbus_message_new_method_return(msg);
+}
+
 static const GDBusMethodTable characteristic_methods[] = {
 	{ GDBUS_ASYNC_METHOD("ReadValue", NULL, GDBUS_ARGS({ "value", "ay" }),
 						characteristic_read_value) },
 	{ GDBUS_ASYNC_METHOD("WriteValue", GDBUS_ARGS({ "value", "ay" }),
 						NULL,
 						characteristic_write_value) },
+	{ GDBUS_ASYNC_METHOD("StartNotify", NULL, NULL,
+						characteristic_start_notify) },
+	{ GDBUS_METHOD("StopNotify", NULL, NULL, characteristic_stop_notify) },
 	{ }
 };
 
@@ -1014,6 +1243,7 @@ static const GDBusSignalTable characteristic_signals[] = {
 static const GDBusPropertyTable characteristic_properties[] = {
 	{ "UUID", "s", characteristic_property_get_uuid },
 	{ "Service", "o", characteristic_property_get_service },
+	{ "Notifying", "b", characteristic_property_get_notifying },
 	{ "Flags", "as", characteristic_property_get_flags },
 	{ }
 };
@@ -1040,19 +1270,29 @@ static void cancel_pending_chrc_requests(struct gatt_dbus_characteristic *chrc)
 							chrc->desc_request);
 		chrc->desc_request = 0;
 	}
+}
 
-	if (chrc->not_id) {
-		DBG("Canceling registered notifications");
-		g_attrib_unregister(chrc->service->client->attrib,
-								chrc->not_id);
-		chrc->not_id = 0;
+static void characteristic_cleanup(struct gatt_dbus_characteristic *chrc)
+{
+	cancel_pending_chrc_requests(chrc);
+
+	while (chrc->notify_list) {
+		struct watch_client *client;
+
+		client = chrc->notify_list->data;
+
+		/* g_dbus_remove_watch will remove the client from the list
+		 * and free it using the notify_destroy function.
+		 */
+		g_dbus_remove_watch(btd_get_dbus_connection(), client->watch);
 	}
 
-	if (chrc->ind_id) {
-		DBG("Canceling registered indications");
-		g_attrib_unregister(chrc->service->client->attrib,
-								chrc->ind_id);
-		chrc->ind_id = 0;
+	notify_cleanup(chrc);
+
+	/* Remove descriptors before removing the characteristic */
+	if (chrc->descriptors) {
+		g_slist_free_full(chrc->descriptors, unregister_descr);
+		chrc->descriptors = NULL;
 	}
 }
 
@@ -1060,16 +1300,7 @@ static void destroy_characteristic(gpointer user_data)
 {
 	struct gatt_dbus_characteristic *chrc = user_data;
 
-	cancel_pending_chrc_requests(chrc);
-
-	/*
-	 * If this happened, and there are still descriptors lying around,
-	 * remove them. Also make sure all pending requests have been canceled.
-	 */
-	if (chrc->descriptors) {
-		g_slist_free_full(chrc->descriptors, unregister_descr);
-		chrc->descriptors = NULL;
-	}
+	characteristic_cleanup(chrc);
 
 	DBG("Destroying GATT characteristic: %s", chrc->path);
 
@@ -1081,13 +1312,7 @@ static void unregister_characteristic(gpointer user_data)
 {
 	struct gatt_dbus_characteristic *chrc = user_data;
 
-	cancel_pending_chrc_requests(chrc);
-
-	/* Remove descriptors before removing the characteristic */
-	if (chrc->descriptors) {
-		g_slist_free_full(chrc->descriptors, unregister_descr);
-		chrc->descriptors = NULL;
-	}
+	characteristic_cleanup(chrc);
 
 	DBG("Unregistering GATT characteristic: %s", chrc->path);
 
