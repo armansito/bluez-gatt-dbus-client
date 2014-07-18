@@ -71,6 +71,7 @@ struct gatt_dbus_service {
 	bool is_primary;
 	char *path;
 
+	bool discovery_complete;  /* all characteristics and descriptors */
 	bool characteristics_discovered;
 	bool discovering;
 
@@ -96,6 +97,7 @@ struct gatt_dbus_characteristic {
 	guint ind_id;
 
 	GSList *descriptors;
+	bool descriptors_discovered;
 
 	bool notifying;
 	GSList *notify_list;  /* list of notification clients */
@@ -616,6 +618,27 @@ fail:
 					"characteristic: %s", chrc->path);
 }
 
+static void check_discovery_complete(struct gatt_dbus_service *service)
+{
+	GSList *l;
+
+	if (service->discovery_complete || !service->characteristics_discovered)
+		return;
+
+	for (l = service->characteristics; l; l = g_slist_next(l)) {
+		struct gatt_dbus_characteristic *chrc = l->data;
+
+		if (!chrc->descriptors_discovered)
+			return;
+	}
+
+	service->discovery_complete = true;
+
+	g_dbus_emit_property_changed(btd_get_dbus_connection(), service->path,
+							GATT_SERVICE_IFACE,
+							"Characteristics");
+}
+
 static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 								void *user_data)
 {
@@ -627,7 +650,7 @@ static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 	chrc->desc_request = 0;
 
 	if (status)
-		return;
+		goto done;
 
 	for (l = descs; l; l = g_slist_next(l)) {
 		desc = l->data;
@@ -661,6 +684,14 @@ static void gatt_discover_desc_cb(uint8_t status, GSList *descs,
 					"characteristic: %s", chrc->path);
 		}
 	}
+
+done:
+	chrc->descriptors_discovered = true;
+	g_dbus_emit_property_changed(btd_get_dbus_connection(), chrc->path,
+						GATT_CHARACTERISTIC_IFACE,
+						"Descriptors");
+
+	check_discovery_complete(chrc->service);
 }
 
 static void characteristic_discover_descriptors(
@@ -767,6 +798,31 @@ static gboolean characteristic_property_get_flags(
 				dbus_message_iter_append_basic(&array,
 							DBUS_TYPE_STRING,
 							&ext_flags[i]);
+		}
+	}
+
+	dbus_message_iter_close_container(iter, &array);
+
+	return TRUE;
+}
+
+static gboolean characteristic_property_get_descriptors(
+					const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct gatt_dbus_characteristic *chrc = data;
+	DBusMessageIter array;
+	GSList *l;
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "o", &array);
+
+	if (chrc->descriptors_discovered) {
+		for (l = chrc->descriptors; l; l = g_slist_next(l)) {
+			const struct gatt_dbus_descriptor *desc = l->data;
+
+			dbus_message_iter_append_basic(&array,
+							DBUS_TYPE_OBJECT_PATH,
+							&desc->path);
 		}
 	}
 
@@ -1245,6 +1301,7 @@ static const GDBusPropertyTable characteristic_properties[] = {
 	{ "Service", "o", characteristic_property_get_service },
 	{ "Notifying", "b", characteristic_property_get_notifying },
 	{ "Flags", "as", characteristic_property_get_flags },
+	{ "Descriptors", "ao", characteristic_property_get_descriptors },
 	{ }
 };
 
@@ -1411,6 +1468,8 @@ static void gatt_discover_characteristics_cb(uint8_t status,
 	service->characteristics_discovered = true;
 	service->discovering = false;
 	service->request = 0;
+
+	check_discovery_complete(service);
 }
 
 static void service_discover_characteristics(struct gatt_dbus_service *service)
@@ -1473,10 +1532,36 @@ static gboolean service_property_get_is_primary(
 	return TRUE;
 }
 
+static gboolean service_property_get_characteristics(
+					const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct gatt_dbus_service *service = data;
+	DBusMessageIter array;
+	GSList *l;
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "o", &array);
+
+	if (service->discovery_complete) {
+		for (l = service->characteristics; l; l = g_slist_next(l)) {
+			const struct gatt_dbus_characteristic *chrc = l->data;
+
+			dbus_message_iter_append_basic(&array,
+							DBUS_TYPE_OBJECT_PATH,
+							&chrc->path);
+		}
+	}
+
+	dbus_message_iter_close_container(iter, &array);
+
+	return TRUE;
+}
+
 static const GDBusPropertyTable service_properties[] = {
 	{ "UUID", "s", service_property_get_uuid },
 	{ "Device", "o", service_property_get_device },
 	{ "Primary", "b", service_property_get_is_primary },
+	{ "Characteristics", "ao", service_property_get_characteristics },
 	{}
 };
 
