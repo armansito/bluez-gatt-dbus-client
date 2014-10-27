@@ -74,6 +74,10 @@
 #define DISCONNECT_TIMER	2
 #define DISCOVERY_TIMER		1
 
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
 static DBusConnection *dbus_conn = NULL;
 unsigned service_state_cb_id;
 
@@ -205,8 +209,11 @@ struct btd_device {
 	GSList		*attios_offline;
 	guint		attachid;		/* Attrib server attach */
 
-	struct bt_att *att;	/* The new ATT transport */
+	struct bt_att *att;			/* The new ATT transport */
+	uint16_t att_mtu;			/* The ATT MTU */
 	unsigned int att_disconn_id;
+
+	struct bt_gatt_client *gatt_client;	/* GATT client cache */
 
 	struct bearer_state bredr_state;
 	struct bearer_state le_state;
@@ -463,6 +470,18 @@ static void browse_request_free(struct browse_req *req)
 	g_free(req);
 }
 
+static void gatt_client_cleanup(struct btd_device *device)
+{
+	if (!device->gatt_client)
+		return;
+
+	bt_gatt_client_set_service_changed(device->gatt_client, NULL, NULL,
+									NULL);
+	bt_gatt_client_set_ready_handler(device->gatt_client, NULL, NULL, NULL);
+	bt_gatt_client_unref(device->gatt_client);
+	device->gatt_client = NULL;
+}
+
 static void attio_cleanup(struct btd_device *device)
 {
 	if (device->attachid) {
@@ -479,6 +498,8 @@ static void attio_cleanup(struct btd_device *device)
 		g_io_channel_unref(device->att_io);
 		device->att_io = NULL;
 	}
+
+	gatt_client_cleanup(device);
 
 	if (device->att) {
 		bt_att_unref(device->att);
@@ -3445,41 +3466,6 @@ done:
 	attio_cleanup(device);
 }
 
-static void register_all_services(struct browse_req *req, GSList *services)
-{
-	struct btd_device *device = req->device;
-
-	btd_device_set_temporary(device, FALSE);
-
-	update_gatt_services(req, device->primaries, services);
-	g_slist_free_full(device->primaries, g_free);
-	device->primaries = NULL;
-
-	device_register_primaries(device, services, -1);
-
-	device_probe_profiles(device, req->profiles_added);
-
-	if (device->attios == NULL && device->attios_offline == NULL)
-		attio_cleanup(device);
-
-	g_dbus_emit_property_changed(dbus_conn, device->path,
-						DEVICE_INTERFACE, "UUIDs");
-
-	device_svc_resolved(device, device->bdaddr_type, 0);
-
-	store_services(device);
-
-	browse_request_free(req);
-}
-
-static int service_by_range_cmp(gconstpointer a, gconstpointer b)
-{
-	const struct gatt_primary *prim = a;
-	const struct att_range *range = b;
-
-	return memcmp(&prim->range, range, sizeof(*range));
-}
-
 static void send_le_browse_response(struct browse_req *req)
 {
 	struct btd_device *dev = req->device;
@@ -3510,122 +3496,152 @@ static void send_le_browse_response(struct browse_req *req)
 	g_dbus_send_reply(dbus_conn, msg, DBUS_TYPE_INVALID);
 }
 
-static void find_included_cb(uint8_t status, GSList *includes, void *user_data)
+/*
+ * TODO: Remove this function once btd_device stops storing gatt_primary
+ * structures for discovered services.
+ */
+static bool populate_primaries(struct btd_device *device, GSList **services)
 {
-	struct included_search *search = user_data;
-	struct btd_device *device = search->req->device;
+	struct bt_gatt_service_iter iter;
+	const bt_gatt_service_t *service;
 	struct gatt_primary *prim;
-	GSList *l;
+	uint128_t u128;
+	bt_uuid_t uuid;
 
-	DBG("status %u", status);
+	/* Create gatt_primary structures for all primary/secondary services */
+	if (!bt_gatt_service_iter_init(&iter, device->gatt_client))
+		return false;
 
-	if (device->attrib == NULL || status) {
-		struct browse_req *req = device->browse;
-
-		if (status)
-			error("Find included services failed: %s (%d)",
-					att_ecode2str(status), status);
-		else
-			error("Disconnected while doing included discovery");
-
-		if (!req)
-			goto complete;
-
-		send_le_browse_response(req);
-		device->browse = NULL;
-		browse_request_free(req);
-
-		goto complete;
-	}
-
-	if (includes == NULL)
-		goto next;
-
-	for (l = includes; l; l = l->next) {
-		struct gatt_included *incl = l->data;
-
-		if (g_slist_find_custom(search->services, &incl->range,
-						service_by_range_cmp))
-			continue;
-
+	while (bt_gatt_service_iter_next(&iter, &service)) {
 		prim = g_new0(struct gatt_primary, 1);
-		memcpy(prim->uuid, incl->uuid, sizeof(prim->uuid));
-		memcpy(&prim->range, &incl->range, sizeof(prim->range));
+		prim->range.start = service->start_handle;
+		prim->range.end = service->end_handle;
 
-		search->services = g_slist_append(search->services, prim);
+		memcpy(u128.data, service->uuid, 16);
+		bt_uuid128_create(&uuid, u128);
+		bt_uuid_to_string(&uuid, prim->uuid, MAX_LEN_UUID_STR + 1);
+
+		*services = g_slist_append(*services, prim);
 	}
 
-next:
-	search->current = search->current->next;
-	if (search->current == NULL) {
-		register_all_services(search->req, search->services);
-		search->services = NULL;
-		goto complete;
-	}
-
-	prim = search->current->data;
-	gatt_find_included(device->attrib, prim->range.start, prim->range.end,
-					find_included_cb, search);
-	return;
-
-complete:
-	g_slist_free_full(search->services, g_free);
-	g_free(search);
+	return true;
 }
 
-static void find_included_services(struct browse_req *req, GSList *services)
+static void register_gatt_services(struct browse_req *req)
 {
 	struct btd_device *device = req->device;
-	struct included_search *search;
-	struct gatt_primary *prim;
-	GSList *l;
+	GSList *services = NULL;
 
-	DBG("service count %u", g_slist_length(services));
-
-	if (services == NULL) {
-		DBG("No services found");
-		register_all_services(req, NULL);
+	if (!bt_gatt_client_is_ready(device->gatt_client))
 		return;
-	}
 
-	search = g_new0(struct included_search, 1);
-	search->req = req;
-
-	/* We have to completely duplicate the data in order to have a
-	 * clearly defined responsibility of freeing regardless of
-	 * failure or success. Otherwise memory leaks are inevitable.
-	 */
-	for (l = services; l; l = g_slist_next(l)) {
-		struct gatt_primary *dup;
-
-		dup = g_memdup(l->data, sizeof(struct gatt_primary));
-
-		search->services = g_slist_append(search->services, dup);
-	}
-
-	search->current = search->services;
-
-	prim = search->current->data;
-	gatt_find_included(device->attrib, prim->range.start, prim->range.end,
-					find_included_cb, search);
-}
-
-static void primary_cb(uint8_t status, GSList *services, void *user_data)
-{
-	struct browse_req *req = user_data;
-
-	DBG("status %u", status);
-
-	if (status) {
-		struct btd_device *device = req->device;
-
+	if (!populate_primaries(device, &services)) {
 		send_le_browse_response(req);
 		device->browse = NULL;
 		browse_request_free(req);
 		return;
 	}
 
-	find_included_services(req, services);
+	btd_device_set_temporary(device, FALSE);
+
+	update_gatt_services(req, device->primaries, services);
+	g_slist_free_full(device->primaries, g_free);
+	device->primaries = NULL;
+
+	device_register_primaries(device, services, -1);
+
+	device_probe_profiles(device, req->profiles_added);
+
+	if (device->attios == NULL && device->attios_offline == NULL)
+		attio_cleanup(device);
+
+	g_dbus_emit_property_changed(dbus_conn, device->path,
+						DEVICE_INTERFACE, "UUIDs");
+
+	device_svc_resolved(device, device->bdaddr_type, 0);
+
+	store_services(device);
+
+	browse_request_free(req);
+}
+
+static void gatt_client_ready_cb(bool success, uint8_t att_ecode,
+								void *user_data)
+{
+	struct btd_device *device = user_data;
+
+	DBG("gatt-client ready -- status: %s, ATT error: %u",
+						success ? "success" : "failed",
+						att_ecode);
+
+	if (!success) {
+		if (device->browse) {
+			struct browse_req *req = device->browse;
+			send_le_browse_response(req);
+			device->browse = NULL;
+			browse_request_free(req);
+		}
+
+		return;
+	}
+
+	device->att_mtu = bt_att_get_mtu(device->att);
+
+	DBG("gatt-client exchanged MTU: %u", device->att_mtu);
+
+	if (device->browse)
+		register_gatt_services(device->browse);
+
+	/*
+	 * TODO: Change attio callbacks to accept a gatt-client instead of a
+	 * GAttrib.
+	 */
+	g_slist_foreach(device->attios, attio_connected, device->attrib);
+}
+
+static void gatt_client_service_changed(uint16_t start_handle,
+							uint16_t end_handle,
+							void *user_data)
+{
+	struct btd_device *device = user_data;
+
+	DBG("gatt-client: Service Changed: start 0x%04x, end: 0x%04x",
+						start_handle, end_handle);
+
+	/*
+	 * TODO: Notify clients that services changed so they can handle it
+	 * directly. Remove the profile if a service was removed.
+	 */
+	device_browse_primary(device, NULL);
+}
+
+static void gatt_client_init(struct btd_device *device)
+{
+	gatt_client_cleanup(device);
+
+	device->gatt_client = bt_gatt_client_new(device->att, device->att_mtu);
+	if (!device->gatt_client) {
+		DBG("Failed to initialize gatt-client");
+		return;
+	}
+
+	if (!bt_gatt_client_set_ready_handler(device->gatt_client,
+							gatt_client_ready_cb,
+							device, NULL)) {
+		DBG("Failed to set ready handler for gatt-client");
+		gatt_client_cleanup(device);
+		return;
+	}
+
+	if (!bt_gatt_client_set_service_changed(device->gatt_client,
+						gatt_client_service_changed,
+						device, NULL)) {
+		DBG("Failed to set service changed handler for gatt-client");
+		gatt_client_cleanup(device);
+		return;
+	}
+
+	DBG("gatt-client created");
 }
 
 bool device_attach_attrib(struct btd_device *dev, GIOChannel *io)
@@ -3660,10 +3676,8 @@ bool device_attach_attrib(struct btd_device *dev, GIOChannel *io)
 		}
 	}
 
-	if (cid == ATT_CID)
-		mtu = BT_ATT_DEFAULT_LE_MTU;
-
-	attrib = g_attrib_new(io, mtu);
+	dev->att_mtu = MIN(mtu, BT_ATT_MAX_LE_MTU);
+	attrib = g_attrib_new(io, dev->att_mtu);
 	if (!attrib) {
 		error("Unable to create new GAttrib instance");
 		return false;
@@ -3678,10 +3692,11 @@ bool device_attach_attrib(struct btd_device *dev, GIOChannel *io)
 
 	dev->attrib = attrib;
 	dev->att = bt_att_ref(g_attrib_get_att(attrib));
-
 	dev->att_disconn_id = bt_att_register_disconnect(dev->att,
 						att_disconnected_cb, dev, NULL);
 	bt_att_set_close_on_unref(dev->att, true);
+
+	gatt_client_init(dev);
 
 	/*
 	 * Remove the device from the connect_list and give the passive
@@ -3689,8 +3704,6 @@ bool device_attach_attrib(struct btd_device *dev, GIOChannel *io)
 	 * other devices in the connect_list.
 	 */
 	adapter_connect_list_remove(dev->adapter, dev);
-
-	g_slist_foreach(dev->attios, attio_connected, dev->attrib);
 
 	return true;
 }
@@ -3845,13 +3858,29 @@ static void att_browse_error_cb(const GError *gerr, gpointer user_data)
 	browse_request_free(req);
 }
 
+static void browse_gatt_client(struct browse_req *req)
+{
+	struct btd_device *device = req->device;
+
+	if (!device->gatt_client) {
+		DBG("No gatt-client currently attached");
+		return;
+	}
+
+	/*
+	 * If gatt-client is ready, then register all services. Otherwise, this
+	 * will be deferred until client becomes ready.
+	 */
+	if (bt_gatt_client_is_ready(device->gatt_client))
+		register_gatt_services(req);
+}
+
 static void att_browse_cb(gpointer user_data)
 {
 	struct att_callbacks *attcb = user_data;
 	struct btd_device *device = attcb->user_data;
 
-	gatt_discover_primary(device->attrib, NULL, primary_cb,
-							device->browse);
+	browse_gatt_client(device->browse);
 }
 
 static int device_browse_primary(struct btd_device *device, DBusMessage *msg)
@@ -3869,7 +3898,7 @@ static int device_browse_primary(struct btd_device *device, DBusMessage *msg)
 	device->browse = req;
 
 	if (device->attrib) {
-		gatt_discover_primary(device->attrib, NULL, primary_cb, req);
+		browse_gatt_client(device->browse);
 		goto done;
 	}
 
@@ -4736,21 +4765,6 @@ struct gatt_primary *btd_device_get_primary(struct btd_device *device,
 GSList *btd_device_get_primaries(struct btd_device *device)
 {
 	return device->primaries;
-}
-
-void btd_device_gatt_set_service_changed(struct btd_device *device,
-						uint16_t start, uint16_t end)
-{
-	GSList *l;
-
-	for (l = device->primaries; l; l = g_slist_next(l)) {
-		struct gatt_primary *prim = l->data;
-
-		if (start <= prim->range.end && end >= prim->range.start)
-			prim->changed = TRUE;
-	}
-
-	device_browse_primary(device, NULL);
 }
 
 void btd_device_add_uuid(struct btd_device *device, const char *uuid)
