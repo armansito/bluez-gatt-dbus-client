@@ -33,6 +33,7 @@ struct bt_att *bt_att_new(int fd);
 struct bt_att *bt_att_ref(struct bt_att *att);
 void bt_att_unref(struct bt_att *att);
 
+int bt_att_get_fd(struct bt_att *att);
 bool bt_att_set_close_on_unref(struct bt_att *att, bool do_close);
 
 typedef void (*bt_att_response_func_t)(uint8_t opcode, const void *pdu,

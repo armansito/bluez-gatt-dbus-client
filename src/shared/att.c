@@ -907,6 +907,14 @@ void bt_att_unref(struct bt_att *att)
 	free(att);
 }
 
+int bt_att_get_fd(struct bt_att *att)
+{
+	if (!att)
+		return -1;
+
+	return att->fd;
+}
+
 bool bt_att_set_close_on_unref(struct bt_att *att, bool do_close)
 {
 	if (!att || !att->io)
