@@ -141,16 +141,15 @@ ATT/GATT (new shared stack)
   Priority: Low
   Complexity: C4
 
-- Move all daemon plugins and profiles that are GATT based to use
-  shared/gatt-client instead of attrib/*. This is a complicated task that
-  potentially needs a new plugin/profile probing interface and a lot of
-  rewriting that can cause regressions in existing functionality. The biggest
-  challenge here is that an instance of bt_att (shared/att) and GAttrib
-  (attrib/gattrib) cannot coexist on the same file descriptor, since they will
-  cause ATT protocol violations by breaking the sequential request-response
-  structure. A special shared/gatt-client-gattrib implementation may be
-  necessary to move each profile/plugin to the new API before actually switching
-  to the shared/att based implementation.
+- Convert all GATT based profiles to use shared/gatt-client. These profiles are:
+    alert
+    cyclingspeed
+    deviceinfo
+    heartrate
+    input/hog
+    proximity
+    scanparam
+    thermometer
 
   Priority: Medium
   Complexity: C4
@@ -182,6 +181,11 @@ ATT/GATT (new shared stack)
 
   Priority: Low
   Complexity: C1
+
+- Replace attrib-server with shared/gatt-db and shared/gatt-server.
+
+  Priority: Medium
+  Complexity: C2
 
 - Implement the server portion of doc/gatt-api.txt using shared/gatt-server once
   it exists.
