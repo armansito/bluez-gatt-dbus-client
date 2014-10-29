@@ -181,6 +181,7 @@ src_bluetoothd_SOURCES = $(builtin_sources) \
 			src/gatt-dbus.h src/gatt-dbus.c \
 			src/gatt.h src/gatt.c \
 			src/device.h src/device.c src/attio.h \
+			src/gatt-callbacks.h \
 			src/dbus-common.c src/dbus-common.h \
 			src/eir.h src/eir.c
 src_bluetoothd_LDADD = lib/libbluetooth-internal.la \

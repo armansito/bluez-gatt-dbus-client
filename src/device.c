@@ -57,6 +57,7 @@
 #include "attrib/gattrib.h"
 #include "attio.h"
 #include "device.h"
+#include "gatt-callbacks.h"
 #include "profile.h"
 #include "service.h"
 #include "dbus-common.h"
@@ -143,6 +144,14 @@ struct attio_data {
 	gpointer user_data;
 };
 
+struct gatt_cb_data {
+	unsigned int id;
+	btd_gatt_client_ready_t ready_func;
+	btd_gatt_client_service_changed_t svc_chngd_func;
+	btd_gatt_disconnect_t disconn_func;
+	void *user_data;
+};
+
 struct svc_callback {
 	unsigned int id;
 	guint idle_id;
@@ -214,6 +223,8 @@ struct btd_device {
 	unsigned int att_disconn_id;
 
 	struct bt_gatt_client *gatt_client;	/* GATT client cache */
+	GSList		*gatt_callbacks;
+	unsigned int	next_gatt_cb_id;
 
 	struct bearer_state bredr_state;
 	struct bearer_state le_state;
@@ -548,6 +559,7 @@ static void device_free(gpointer user_data)
 	g_slist_free_full(device->attios, g_free);
 	g_slist_free_full(device->attios_offline, g_free);
 	g_slist_free_full(device->svc_callbacks, svc_dev_remove);
+	g_slist_free_full(device->gatt_callbacks, g_free);
 
 	attio_cleanup(device);
 
@@ -3430,6 +3442,16 @@ static void attio_disconnected(gpointer data, gpointer user_data)
 		attio->dcfunc(attio->user_data);
 }
 
+static void gatt_disconnected(gpointer data, gpointer user_data)
+{
+	struct gatt_cb_data *gatt_data = data;
+
+	DBG("");
+
+	if (gatt_data->disconn_func)
+		gatt_data->disconn_func(gatt_data->user_data);
+}
+
 static void att_disconnected_cb(void *user_data)
 {
 	struct btd_device *device = user_data;
@@ -3448,6 +3470,7 @@ static void att_disconnected_cb(void *user_data)
 	DBG("%s (%d)", strerror(err), err);
 
 	g_slist_foreach(device->attios, attio_disconnected, NULL);
+	g_slist_foreach(device->gatt_callbacks, gatt_disconnected, NULL);
 
 	if (!device_get_auto_connect(device)) {
 		DBG("Automatic connection disabled");
@@ -3552,7 +3575,14 @@ static void register_gatt_services(struct browse_req *req)
 
 	device_probe_profiles(device, req->profiles_added);
 
-	if (device->attios == NULL && device->attios_offline == NULL)
+	/* TODO: This check seems unnecessary. I don't we would want to cleanup
+	 * the connection since there will always be built-in plugins who want
+	 * to interact with remote GATT services. Even if we didn't have those,
+	 * the GATT D-Bus API will need to interact with these, so we should
+	 * later remove this check entirely.
+	 */
+	if (device->attios == NULL && device->attios_offline == NULL &&
+						device->gatt_callbacks == NULL)
 		attio_cleanup(device);
 
 	g_dbus_emit_property_changed(dbus_conn, device->path,
@@ -3563,6 +3593,17 @@ static void register_gatt_services(struct browse_req *req)
 	store_services(device);
 
 	browse_request_free(req);
+}
+
+static void notify_gatt_client_ready(gpointer data, gpointer user_data)
+{
+	struct gatt_cb_data *gatt_data = data;
+	struct bt_gatt_client *client = user_data;
+
+	DBG("");
+
+	if (gatt_data->ready_func)
+		gatt_data->ready_func(client, gatt_data->user_data);
 }
 
 static void gatt_client_ready_cb(bool success, uint8_t att_ecode,
@@ -3592,11 +3633,30 @@ static void gatt_client_ready_cb(bool success, uint8_t att_ecode,
 	if (device->browse)
 		register_gatt_services(device->browse);
 
-	/*
-	 * TODO: Change attio callbacks to accept a gatt-client instead of a
-	 * GAttrib.
-	 */
 	g_slist_foreach(device->attios, attio_connected, device->attrib);
+	g_slist_foreach(device->gatt_callbacks, notify_gatt_client_ready,
+							device->gatt_client);
+}
+
+struct svc_chngd_data {
+	struct bt_gatt_client *client;
+	uint16_t start_handle;
+	uint16_t end_handle;
+};
+
+static void notify_gatt_svc_chngd(gpointer data, gpointer user_data)
+{
+	struct gatt_cb_data *gatt_data = data;
+	struct svc_chngd_data *svc_data = user_data;
+
+	DBG("start: 0x%04x, end: 0x%04x", svc_data->start_handle,
+							svc_data->end_handle);
+
+	if (gatt_data->svc_chngd_func)
+		gatt_data->svc_chngd_func(svc_data->client,
+							svc_data->start_handle,
+							svc_data->end_handle,
+							gatt_data->user_data);
 }
 
 static void gatt_client_service_changed(uint16_t start_handle,
@@ -3604,14 +3664,17 @@ static void gatt_client_service_changed(uint16_t start_handle,
 							void *user_data)
 {
 	struct btd_device *device = user_data;
+	struct svc_chngd_data data;
 
 	DBG("gatt-client: Service Changed: start 0x%04x, end: 0x%04x",
 						start_handle, end_handle);
 
-	/*
-	 * TODO: Notify clients that services changed so they can handle it
-	 * directly. Remove the profile if a service was removed.
-	 */
+	memset(&data, 0, sizeof(data));
+	data.client = device->gatt_client;
+	data.start_handle = start_handle;
+	data.end_handle = end_handle;
+
+	g_slist_foreach(device->gatt_callbacks, notify_gatt_svc_chngd, &data);
 	device_browse_primary(device, NULL);
 }
 
@@ -4980,12 +5043,89 @@ gboolean btd_device_remove_attio_callback(struct btd_device *device, guint id)
 
 	g_free(attio);
 
-	if (device->attios != NULL || device->attios_offline != NULL)
+	if (device->attios != NULL || device->attios_offline != NULL ||
+						device->gatt_callbacks != NULL)
 		return TRUE;
 
 	attio_cleanup(device);
 
 	return TRUE;
+}
+
+unsigned int btd_device_add_gatt_callbacks(struct btd_device *device,
+			btd_gatt_client_ready_t ready_func,
+			btd_gatt_client_service_changed_t service_changed_func,
+			btd_gatt_disconnect_t disconnect_func,
+			void *user_data)
+{
+	struct gatt_cb_data *gatt_data;
+
+	gatt_data = new0(struct gatt_cb_data, 1);
+	if (!gatt_data)
+		return 0;
+
+	if (device->next_gatt_cb_id < 1)
+		device->next_gatt_cb_id = 1;
+
+	device_set_auto_connect(device, TRUE);
+
+	gatt_data->id = device->next_gatt_cb_id++;
+	gatt_data->ready_func = ready_func;
+	gatt_data->svc_chngd_func = service_changed_func;
+	gatt_data->disconn_func = disconnect_func;
+	gatt_data->user_data = user_data;
+
+	/*
+	 * TODO: The connection might be incoming from attrib-server (see
+	 * btd_device_add_attio_callback). I don't think this is a good place to
+	 * attach the GAttrib to the device. We should come up with a more
+	 * unified flow for attaching the GAttrib, bt_att, and bt_gatt_client
+	 * for incoming and outgoing connections.
+	 */
+	device->gatt_callbacks = g_slist_append(device->gatt_callbacks,
+								gatt_data);
+
+	if (ready_func && bt_gatt_client_is_ready(device->gatt_client))
+		ready_func(device->gatt_client, user_data);
+
+	return gatt_data->id;
+}
+
+static int gatt_cb_id_cmp(gconstpointer a, gconstpointer b)
+{
+	const struct gatt_cb_data *gatt_data = a;
+	guint id = GPOINTER_TO_UINT(b);
+
+	return gatt_data->id - id;
+}
+
+bool btd_device_remove_gatt_callbacks(struct btd_device *device,
+							unsigned int id)
+{
+	struct gatt_cb_data *gatt_data;
+	GSList *l;
+
+	l = g_slist_find_custom(device->gatt_callbacks, GUINT_TO_POINTER(id),
+								gatt_cb_id_cmp);
+	if (!l)
+		return false;
+
+	gatt_data = l->data;
+	device->gatt_callbacks = g_slist_remove(device->gatt_callbacks,
+								gatt_data);
+	free(gatt_data);
+
+	/*
+	 * TODO: Consider removing this check and avoiding cleanup as it seems
+	 * unnecessary.
+	 */
+	if (device->attios != NULL || device->attios_offline != NULL ||
+						device->gatt_callbacks != NULL)
+		return true;
+
+	attio_cleanup(device);
+
+	return true;
 }
 
 void btd_device_set_pnpid(struct btd_device *device, uint16_t source,
