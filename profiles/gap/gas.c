@@ -174,7 +174,7 @@ static void gas_unregister(struct btd_device *device)
 	gas_free(gas);
 }
 
-static int gatt_driver_probe(struct btd_service *service)
+static int gap_driver_probe(struct btd_service *service)
 {
 	struct btd_device *device = btd_service_get_device(service);
 	struct gatt_primary *gap;
@@ -189,31 +189,31 @@ static int gatt_driver_probe(struct btd_service *service)
 	return gas_register(device, &gap->range);
 }
 
-static void gatt_driver_remove(struct btd_service *service)
+static void gap_driver_remove(struct btd_service *service)
 {
 	struct btd_device *device = btd_service_get_device(service);
 
 	gas_unregister(device);
 }
 
-static struct btd_profile gatt_profile = {
-	.name		= "gap-gatt-profile",
-	.remote_uuid	= GATT_UUID,
-	.device_probe	= gatt_driver_probe,
-	.device_remove	= gatt_driver_remove
+static struct btd_profile gap_profile = {
+	.name		= "gap-profile",
+	.remote_uuid	= GAP_UUID,
+	.device_probe	= gap_driver_probe,
+	.device_remove	= gap_driver_remove
 };
 
-static int gatt_init(void)
+static int gap_init(void)
 {
-	btd_profile_register(&gatt_profile);
+	btd_profile_register(&gap_profile);
 
 	return 0;
 }
 
-static void gatt_exit(void)
+static void gap_exit(void)
 {
-	btd_profile_unregister(&gatt_profile);
+	btd_profile_unregister(&gap_profile);
 }
 
-BLUETOOTH_PLUGIN_DEFINE(gatt, VERSION, BLUETOOTH_PLUGIN_PRIORITY_DEFAULT,
-					gatt_init, gatt_exit)
+BLUETOOTH_PLUGIN_DEFINE(gap, VERSION, BLUETOOTH_PLUGIN_PRIORITY_DEFAULT,
+							gap_init, gap_exit)
