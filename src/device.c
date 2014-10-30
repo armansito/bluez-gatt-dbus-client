@@ -58,6 +58,7 @@
 #include "attio.h"
 #include "device.h"
 #include "gatt-callbacks.h"
+#include "gatt-client.h"
 #include "profile.h"
 #include "service.h"
 #include "dbus-common.h"
@@ -225,6 +226,8 @@ struct btd_device {
 	struct bt_gatt_client *gatt_client;	/* GATT client cache */
 	GSList		*gatt_callbacks;
 	unsigned int	next_gatt_cb_id;
+
+	struct btd_gatt_client *gatt_client_dbus;
 
 	struct bearer_state bredr_state;
 	struct bearer_state le_state;
@@ -553,6 +556,9 @@ static void svc_dev_remove(gpointer user_data)
 static void device_free(gpointer user_data)
 {
 	struct btd_device *device = user_data;
+
+	btd_gatt_client_destroy(device->gatt_client_dbus);
+	device->gatt_client_dbus = NULL;
 
 	g_slist_free_full(device->uuids, g_free);
 	g_slist_free_full(device->primaries, g_free);
@@ -2382,6 +2388,15 @@ static struct btd_device *device_new(struct btd_adapter *adapter,
 	g_strdelimit(device->path, ":", '_');
 	g_free(address_up);
 
+	str2ba(address, &device->bdaddr);
+
+	device->gatt_client_dbus = btd_gatt_client_new(device);
+	if (!device->gatt_client_dbus) {
+		error("Failed to create btd_gatt_client");
+		device_free(device);
+		return NULL;
+	}
+
 	DBG("Creating device %s", device->path);
 
 	if (g_dbus_register_interface(dbus_conn,
@@ -2394,7 +2409,6 @@ static struct btd_device *device_new(struct btd_adapter *adapter,
 		return NULL;
 	}
 
-	str2ba(address, &device->bdaddr);
 	device->adapter = adapter;
 	device->temporary = TRUE;
 
