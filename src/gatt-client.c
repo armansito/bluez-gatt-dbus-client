@@ -48,6 +48,7 @@
 
 #define GATT_SERVICE_IFACE		"org.bluez.GattService1"
 #define GATT_CHARACTERISTIC_IFACE	"org.bluez.GattCharacteristic1"
+#define GATT_DESCRIPTOR_IFACE		"org.bluez.GattDescriptor1"
 
 struct btd_gatt_client {
 	struct btd_device *device;
@@ -76,6 +77,14 @@ struct characteristic {
 	uint8_t props;
 	uint8_t uuid[BT_GATT_UUID_SIZE];
 	char *path;
+	struct queue *descs;
+};
+
+struct descriptor {
+	struct characteristic *chrc;
+	uint16_t handle;
+	uint8_t uuid[BT_GATT_UUID_SIZE];
+	char *path;
 };
 
 static void uuid128_to_string(const uint8_t uuid[16], char *str, size_t n)
@@ -86,6 +95,126 @@ static void uuid128_to_string(const uint8_t uuid[16], char *str, size_t n)
 	memcpy(u128.data, uuid, sizeof(uint8_t) * 16);
 	bt_uuid128_create(&uuid128, u128);
 	bt_uuid_to_string(&uuid128, str, n);
+}
+
+static gboolean descriptor_property_get_uuid(const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	char uuid[MAX_LEN_UUID_STR + 1];
+	const char *ptr = uuid;
+	struct descriptor *desc = data;
+
+	uuid128_to_string(desc->uuid, uuid, sizeof(uuid));
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &ptr);
+
+	return TRUE;
+}
+
+static gboolean descriptor_property_get_characteristic(
+					const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct descriptor *desc = data;
+	const char *str = desc->chrc->path;
+
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_OBJECT_PATH, &str);
+
+	return TRUE;
+}
+
+static gboolean descriptor_property_get_value(const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	DBusMessageIter array;
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "y", &array);
+
+	/* TODO: Implement this once the value is cached */
+
+	dbus_message_iter_close_container(iter, &array);
+
+	return TRUE;
+}
+
+static DBusMessage *descriptor_read_value(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	/* TODO: Implement */
+	return btd_error_failed(msg, "Not implemented");
+}
+
+static DBusMessage *descriptor_write_value(DBusConnection *conn,
+					DBusMessage *msg, void *user_data)
+{
+	/* TODO: Implement */
+	return btd_error_failed(msg, "Not implemented");
+}
+
+static const GDBusPropertyTable descriptor_properties[] = {
+	{ "UUID", "s", descriptor_property_get_uuid },
+	{ "Characteristic", "o", descriptor_property_get_characteristic },
+	{ "Value", "ay", descriptor_property_get_value },
+	{ }
+};
+
+static const GDBusMethodTable descriptor_methods[] = {
+	{ GDBUS_ASYNC_METHOD("ReadValue", NULL, GDBUS_ARGS({ "value", "ay" }),
+						descriptor_read_value) },
+	{ GDBUS_ASYNC_METHOD("WriteValue", GDBUS_ARGS({ "value", "ay" }),
+					NULL, descriptor_write_value) },
+	{ }
+};
+
+static void descriptor_free(void *data)
+{
+	struct descriptor *desc = data;
+
+	g_free(desc->path);
+	free(desc);
+}
+
+static struct descriptor *descriptor_create(
+					const bt_gatt_descriptor_t *desc_data,
+					struct characteristic *chrc)
+{
+	struct descriptor *desc;
+
+	desc = new0(struct descriptor, 1);
+	if (!desc)
+		return NULL;
+
+	desc->path = g_strdup_printf("%s/desc%04x", chrc->path,
+							desc_data->handle);
+	desc->chrc = chrc;
+	desc->handle = desc_data->handle;
+
+	memcpy(desc->uuid, desc_data->uuid, sizeof(desc->uuid));
+
+	if (!g_dbus_register_interface(btd_get_dbus_connection(), desc->path,
+						GATT_DESCRIPTOR_IFACE,
+						descriptor_methods, NULL,
+						descriptor_properties,
+						desc, descriptor_free)) {
+		error("Unable to register GATT descriptor with handle 0x%04x",
+								desc->handle);
+		descriptor_free(desc);
+
+		return NULL;
+	}
+
+	DBG("Exported GATT characteristic descriptor: %s", desc->path);
+
+	return desc;
+}
+
+static void unregister_descriptor(void *data)
+{
+	struct descriptor *desc = data;
+
+	DBG("Removing GATT descriptor: %s", desc->path);
+
+	g_dbus_unregister_interface(btd_get_dbus_connection(), desc->path,
+							GATT_DESCRIPTOR_IFACE);
 }
 
 static gboolean characteristic_property_get_uuid(
@@ -219,15 +348,25 @@ static DBusMessage *characteristic_stop_notify(DBusConnection *conn,
 	return btd_error_failed(msg, "Not implemented");
 }
 
+static void append_desc_path(void *data, void *user_data)
+{
+	struct descriptor *desc = data;
+	DBusMessageIter *array = user_data;
+
+	dbus_message_iter_append_basic(array, DBUS_TYPE_OBJECT_PATH,
+								&desc->path);
+}
+
 static gboolean characteristic_property_get_descriptors(
 					const GDBusPropertyTable *property,
 					DBusMessageIter *iter, void *data)
 {
+	struct characteristic *chrc = data;
 	DBusMessageIter array;
 
 	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "o", &array);
 
-	/* TODO: Implement this once descriptors are exported */
+	queue_foreach(chrc->descs, append_desc_path, &array);
 
 	dbus_message_iter_close_container(iter, &array);
 
@@ -259,6 +398,7 @@ static void characteristic_free(void *data)
 {
 	struct characteristic *chrc = data;
 
+	queue_destroy(chrc->descs, NULL);  /* List should be empty here */
 	g_free(chrc->path);
 	free(chrc);
 }
@@ -273,7 +413,13 @@ static struct characteristic *characteristic_create(
 	if (!chrc)
 		return NULL;
 
-	chrc->path = g_strdup_printf("%s/chrc%04x", service->path,
+	chrc->descs = queue_new();
+	if (!chrc->descs) {
+		free(chrc);
+		return NULL;
+	}
+
+	chrc->path = g_strdup_printf("%s/char%04x", service->path,
 						chrc_data->start_handle);
 	chrc->service = service;
 	chrc->handle = chrc_data->start_handle;
@@ -304,6 +450,8 @@ static void unregister_characteristic(void *data)
 	struct characteristic *chrc = data;
 
 	DBG("Removing GATT characteristic: %s", chrc->path);
+
+	queue_remove_all(chrc->descs, NULL, NULL, unregister_descriptor);
 
 	g_dbus_unregister_interface(btd_get_dbus_connection(), chrc->path,
 						GATT_CHARACTERISTIC_IFACE);
@@ -445,6 +593,23 @@ static void unregister_service(void *data)
 							GATT_SERVICE_IFACE);
 }
 
+static bool create_descriptors(const bt_gatt_characteristic_t *chrc,
+					struct characteristic *dbus_chrc)
+{
+	size_t i;
+	struct descriptor *dbus_desc;
+
+	for (i = 0; i < chrc->num_descs; i++) {
+		dbus_desc = descriptor_create(chrc->descs + i, dbus_chrc);
+		if (!dbus_desc)
+			return false;
+
+		queue_push_tail(dbus_chrc->descs, dbus_desc);
+	}
+
+	return true;
+}
+
 static bool create_characteristics(const bt_gatt_service_t *service,
 						struct service *dbus_service)
 {
@@ -461,6 +626,13 @@ static bool create_characteristics(const bt_gatt_service_t *service,
 		dbus_chrc = characteristic_create(chrc, dbus_service);
 		if (!dbus_chrc)
 			return false;
+
+		if (!create_descriptors(chrc, dbus_chrc)) {
+			error("Exporting descriptors failed");
+			unregister_characteristic(dbus_chrc);
+
+			return false;
+		}
 
 		queue_push_tail(dbus_service->chrcs, dbus_chrc);
 	}
