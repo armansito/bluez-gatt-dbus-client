@@ -1598,6 +1598,14 @@ bool bt_gatt_client_set_debug(struct bt_gatt_client *client,
 	return true;
 }
 
+uint16_t bt_gatt_client_get_mtu(struct bt_gatt_client *client)
+{
+	if (!client || !client->att)
+		return 0;
+
+	return bt_att_get_mtu(client->att);
+}
+
 bool bt_gatt_service_iter_init(struct bt_gatt_service_iter *iter,
 						struct bt_gatt_client *client)
 {
@@ -2013,7 +2021,7 @@ bool bt_gatt_client_read_long_value(struct bt_gatt_client *client,
 bool bt_gatt_client_write_without_response(struct bt_gatt_client *client,
 					uint16_t value_handle,
 					bool signed_write,
-					uint8_t *value, uint16_t length) {
+					const uint8_t *value, uint16_t length) {
 	uint8_t pdu[2 + length];
 
 	if (!client)
@@ -2069,7 +2077,7 @@ done:
 
 bool bt_gatt_client_write_value(struct bt_gatt_client *client,
 					uint16_t value_handle,
-					uint8_t *value, uint16_t length,
+					const uint8_t *value, uint16_t length,
 					bt_gatt_client_callback_t callback,
 					void *user_data,
 					bt_gatt_client_destroy_func_t destroy)
@@ -2318,7 +2326,7 @@ done:
 bool bt_gatt_client_write_long_value(struct bt_gatt_client *client,
 				bool reliable,
 				uint16_t value_handle, uint16_t offset,
-				uint8_t *value, uint16_t length,
+				const uint8_t *value, uint16_t length,
 				bt_gatt_client_write_long_callback_t callback,
 				void *user_data,
 				bt_gatt_client_destroy_func_t destroy)
