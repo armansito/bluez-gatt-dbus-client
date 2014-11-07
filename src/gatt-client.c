@@ -1642,6 +1642,10 @@ static void notify_chrcs(void *data, void *user_data)
 {
 	struct service *service = data;
 
+	if (service->chrcs_ready ||
+				!queue_isempty(service->pending_ext_props))
+		return;
+
 	service->chrcs_ready = true;
 
 	g_dbus_emit_property_changed(btd_get_dbus_connection(), service->path,
@@ -1691,9 +1695,7 @@ static void read_ext_props_cb(bool success, uint8_t att_ecode,
 						GATT_SERVICE_IFACE, "Flags");
 
 	queue_remove(service->pending_ext_props, chrc);
-
-	if (queue_isempty(service->pending_ext_props))
-		notify_chrcs(service, NULL);
+	notify_chrcs(service, NULL);
 }
 
 static void read_ext_props(void *data, void *user_data)
@@ -1755,7 +1757,8 @@ static gboolean set_chrcs_ready(gpointer user_data)
 	return FALSE;
 }
 
-static void create_services(struct btd_gatt_client *client)
+static void create_services_in_range(struct btd_gatt_client *client,
+						uint16_t start, uint16_t end)
 {
 	struct bt_gatt_service_iter iter;
 	const bt_gatt_service_t *service = NULL;
@@ -1769,6 +1772,12 @@ static void create_services(struct btd_gatt_client *client)
 	}
 
 	while (bt_gatt_service_iter_next(&iter, &service)) {
+		if (service->end_handle < start)
+			continue;
+
+		if (service->start_handle > end)
+			break;
+
 		dbus_service = service_create(service, client);
 		if (!dbus_service)
 			continue;
@@ -1791,9 +1800,12 @@ static void create_services(struct btd_gatt_client *client)
 	 * If there are any pending reads to obtain the value of the "Extended
 	 * Properties" descriptor then wait until they are complete.
 	 */
-	if (!dbus_service->chrcs_ready &&
-				queue_isempty(dbus_service->pending_ext_props))
-		g_idle_add(set_chrcs_ready, client);
+	g_idle_add(set_chrcs_ready, client);
+}
+
+static void create_services(struct btd_gatt_client *client)
+{
+	create_services_in_range(client, 0x0000, 0xffff);
 }
 
 static void gatt_ready_cb(struct bt_gatt_client *gatt, void *user_data)
@@ -1805,12 +1817,39 @@ static void gatt_ready_cb(struct bt_gatt_client *gatt, void *user_data)
 	create_services(client);
 }
 
-static void gatt_svc_chngd_cb(struct bt_gatt_client *client,
+struct svc_chngd_data {
+	uint16_t start_handle;
+	uint16_t end_handle;
+};
+
+static bool match_handle_range(const void *a, const void *b)
+{
+	const struct service *service = a;
+	const struct svc_chngd_data *data = b;
+
+	return service->start_handle <= data->end_handle &&
+				service->end_handle >= data->start_handle;
+}
+
+static void gatt_svc_chngd_cb(struct bt_gatt_client *gatt,
 						uint16_t start_handle,
 						uint16_t end_handle,
 						void *user_data)
 {
-	/* TODO */
+	struct btd_gatt_client *client = user_data;
+	struct svc_chngd_data data;
+
+	DBG("GATT Services Changed - start: 0x%04x, end: 0x%04x", start_handle,
+								end_handle);
+
+	data.start_handle = start_handle;
+	data.end_handle = end_handle;
+
+	/* Remove all affected services */
+	queue_remove_all(client->services, match_handle_range, &data,
+							unregister_service);
+
+	create_services_in_range(client, start_handle, end_handle);
 }
 
 static void gatt_disconn_cb(void *user_data)
