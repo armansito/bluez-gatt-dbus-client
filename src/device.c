@@ -3721,6 +3721,13 @@ static void gatt_client_init(struct btd_device *device)
 	DBG("gatt-client created");
 }
 
+static void att_debug(const char *str, void *user_data)
+{
+	const char *prefix = user_data;
+
+	DBG("%s%s", prefix, str);
+}
+
 bool device_attach_attrib(struct btd_device *dev, GIOChannel *io)
 {
 	GError *gerr = NULL;
@@ -3772,6 +3779,7 @@ bool device_attach_attrib(struct btd_device *dev, GIOChannel *io)
 	dev->att_disconn_id = bt_att_register_disconnect(dev->att,
 						att_disconnected_cb, dev, NULL);
 	bt_att_set_close_on_unref(dev->att, true);
+	bt_att_set_debug(dev->att, att_debug, "att: ", NULL);
 
 	gatt_client_init(dev);
 
