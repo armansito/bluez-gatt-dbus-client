@@ -416,9 +416,6 @@ static bool timeout_cb(void *user_data)
 	if (!op)
 		return false;
 
-	io_destroy(att->io);
-	att->io = NULL;
-
 	util_debug(att->debug_callback, att->debug_data,
 				"Operation timed out: 0x%02x", op->opcode);
 
@@ -427,6 +424,13 @@ static bool timeout_cb(void *user_data)
 
 	op->timeout_id = 0;
 	destroy_att_send_op(op);
+
+	/*
+	 * Directly terminate the connection as required by the ATT protocol.
+	 * This should trigger an io disconnect event which will clean up the
+	 * io and notify the upper layer.
+	 */
+	close(att->fd);
 
 	return false;
 }
@@ -765,14 +769,15 @@ static bool can_read_data(struct io *io, void *user_data)
 	case ATT_OP_TYPE_REQ:
 		/*
 		 * If a request is currently pending, then the sequential
-		 * protocol was violated. Disconnect the bearer and notify the
-		 * upper-layer.
+		 * protocol was violated. Disconnect the bearer, which will
+		 * promptly notify the upper layer via disconnect handlers.
 		 */
 		if (att->in_req) {
 			util_debug(att->debug_callback, att->debug_data,
 					"Received request while another is "
 					"pending: 0x%02x", opcode);
-			disconnect_cb(att->io, att);
+			close(att->fd);
+
 			return false;
 		}
 
