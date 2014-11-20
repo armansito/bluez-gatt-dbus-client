@@ -67,6 +67,8 @@ bool bt_att_cancel_all(struct bt_att *att);
 unsigned int bt_att_send_error_rsp(struct bt_att *att, uint8_t opcode,
 						uint16_t handle, int error);
 
+const char *bt_att_ecode_to_string(uint8_t ecode);
+
 unsigned int bt_att_register(struct bt_att *att, uint8_t opcode,
 						bt_att_notify_func_t callback,
 						void *user_data,
