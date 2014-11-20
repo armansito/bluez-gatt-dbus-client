@@ -27,162 +27,161 @@
 #include <stdbool.h>
 #include <errno.h>
 
-#include <glib.h>
-
 #include "lib/uuid.h"
-#include "src/plugin.h"
 #include "src/adapter.h"
 #include "src/device.h"
+#include "src/plugin.h"
 #include "src/profile.h"
 #include "src/service.h"
 #include "src/shared/util.h"
-#include "attrib/gattrib.h"
-#include "src/attio.h"
-#include "attrib/att.h"
-#include "attrib/gatt.h"
+#include "src/shared/att.h"
+#include "src/shared/gatt-client.h"
 #include "src/log.h"
+#include "src/gatt-callbacks.h"
 
 #define PNP_ID_SIZE	7
 
-struct deviceinfo {
-	struct btd_device	*dev;		/* Device reference */
-	GAttrib			*attrib;	/* GATT connection */
-	guint			attioid;	/* Att watcher id */
-	struct att_range	*svc_range;	/* DeviceInfo range */
-	GSList			*chars;		/* Characteristics */
+struct profile_data {
+	struct btd_device *dev;
+	struct bt_gatt_client *client;
+	uint16_t start_handle, end_handle;
+	unsigned int gatt_cb_id;
 };
 
-struct characteristic {
-	struct gatt_char	attr;	/* Characteristic */
-	struct deviceinfo	*d;	/* deviceinfo where the char belongs */
-};
-
-static void deviceinfo_driver_remove(struct btd_service *service)
+static void read_pnpid_cb(bool success, uint8_t att_ecode, const uint8_t *value,
+					uint16_t length, void *user_data)
 {
-	struct deviceinfo *d = btd_service_get_user_data(service);
+	struct profile_data *pdata = user_data;
 
-	if (d->attioid > 0)
-		btd_device_remove_attio_callback(d->dev, d->attioid);
-
-	if (d->attrib != NULL)
-		g_attrib_unref(d->attrib);
-
-	g_slist_free_full(d->chars, g_free);
-
-	btd_device_unref(d->dev);
-	g_free(d->svc_range);
-	g_free(d);
-}
-
-static void read_pnpid_cb(guint8 status, const guint8 *pdu, guint16 len,
-							gpointer user_data)
-{
-	struct characteristic *ch = user_data;
-	uint8_t value[PNP_ID_SIZE];
-	ssize_t vlen;
-
-	if (status != 0) {
-		error("Error reading PNP_ID value: %s", att_ecode2str(status));
+	if (!success) {
+		error("Error reading PNP_ID value: %s",
+					bt_att_ecode_to_string(att_ecode));
 		return;
 	}
 
-	vlen = dec_read_resp(pdu, len, value, sizeof(value));
-	if (vlen < 0) {
-		error("Error reading PNP_ID: Protocol error");
-		return;
-	}
-
-	if (vlen < 7) {
+	if (length < PNP_ID_SIZE) {
 		error("Error reading PNP_ID: Invalid pdu length received");
 		return;
 	}
 
-	btd_device_set_pnpid(ch->d->dev, value[0], get_le16(&value[1]),
+	btd_device_set_pnpid(pdata->dev, value[0], get_le16(&value[1]),
 				get_le16(&value[3]), get_le16(&value[5]));
 }
 
-static void process_deviceinfo_char(struct characteristic *ch)
+static void handle_pnpid(struct profile_data *pdata,
+					const bt_gatt_characteristic_t *chrc)
 {
-	if (g_strcmp0(ch->attr.uuid, PNPID_UUID) == 0)
-		gatt_read_char(ch->d->attrib, ch->attr.value_handle,
-							read_pnpid_cb, ch);
+	if (!bt_gatt_client_read_long_value(pdata->client, chrc->value_handle,
+						0, read_pnpid_cb, pdata, NULL))
+		DBG("Request to read value of PNP_ID failed");
 }
 
-static void configure_deviceinfo_cb(uint8_t status, GSList *characteristics,
-								void *user_data)
+static bool uuid_match(uint16_t u16, const uint8_t uuid[16])
 {
-	struct deviceinfo *d = user_data;
-	GSList *l;
+	uint128_t u128;
+	bt_uuid_t lhs, rhs;
 
-	if (status != 0) {
-		error("Discover deviceinfo characteristics: %s",
-							att_ecode2str(status));
+	memcpy(u128.data, uuid, sizeof(uint8_t) * 16);
+	bt_uuid16_create(&lhs, u16);
+	bt_uuid128_create(&rhs, u128);
+
+	return bt_uuid_cmp(&lhs, &rhs) == 0;
+}
+
+
+static void init_deviceinfo_service(struct profile_data *pdata)
+{
+	struct bt_gatt_service_iter iter;
+	struct bt_gatt_characteristic_iter chrc_iter;
+	const bt_gatt_service_t *service = NULL;
+	const bt_gatt_characteristic_t *chrc = NULL;
+	bt_uuid_t deviceinfo_uuid;
+
+	bt_string_to_uuid(&deviceinfo_uuid, DEVICE_INFORMATION_UUID);
+
+	if (!bt_gatt_service_iter_init(&iter, pdata->client)) {
+		DBG("Cannot initialize service iterator");
 		return;
 	}
 
-	for (l = characteristics; l; l = l->next) {
-		struct gatt_char *c = l->data;
-		struct characteristic *ch;
+	if (!bt_gatt_service_iter_next_by_uuid(&iter,
+						deviceinfo_uuid.value.u128.data,
+						&service)) {
+		error("Device info service not found on device");
+		return;
+	}
 
-		ch = g_new0(struct characteristic, 1);
-		ch->attr.handle = c->handle;
-		ch->attr.properties = c->properties;
-		ch->attr.value_handle = c->value_handle;
-		memcpy(ch->attr.uuid, c->uuid, MAX_LEN_UUID_STR + 1);
-		ch->d = d;
+	pdata->start_handle = service->start_handle;
+	pdata->end_handle = service->end_handle;
 
-		d->chars = g_slist_append(d->chars, ch);
 
-		process_deviceinfo_char(ch);
+	if (!bt_gatt_characteristic_iter_init(&chrc_iter, service)) {
+		DBG("Failed to initialize characteristic iterator");
+		return;
+	}
+
+	while (bt_gatt_characteristic_iter_next(&chrc_iter, &chrc)) {
+		if (uuid_match(GATT_CHARAC_PNP_ID, chrc->uuid))
+			handle_pnpid(pdata, chrc);
 	}
 }
-static void attio_connected_cb(GAttrib *attrib, gpointer user_data)
+
+static void gatt_ready_cb(struct bt_gatt_client *client, void *user_data)
 {
-	struct deviceinfo *d = user_data;
+	struct profile_data *pdata = user_data;
 
-	d->attrib = g_attrib_ref(attrib);
+	pdata->client = client;
 
-	gatt_discover_char(d->attrib, d->svc_range->start, d->svc_range->end,
-					NULL, configure_deviceinfo_cb, d);
+	init_deviceinfo_service(pdata);
 }
 
-static void attio_disconnected_cb(gpointer user_data)
-{
-	struct deviceinfo *d = user_data;
+static void gatt_changed_cb(struct bt_gatt_client *client,
+				uint16_t start_handle, uint16_t end_handle,
+				void *user_data) {
+	struct profile_data *pdata = user_data;
 
-	g_attrib_unref(d->attrib);
-	d->attrib = NULL;
-}
+	if (!pdata->client || !pdata->start_handle || !pdata->end_handle)
+		return;
 
-static int deviceinfo_register(struct btd_service *service,
-						struct gatt_primary *prim)
-{
-	struct btd_device *device = btd_service_get_device(service);
-	struct deviceinfo *d;
+	if (pdata->end_handle < start_handle ||
+					pdata->start_handle > end_handle)
+		return;
 
-	d = g_new0(struct deviceinfo, 1);
-	d->dev = btd_device_ref(device);
-	d->svc_range = g_new0(struct att_range, 1);
-	d->svc_range->start = prim->range.start;
-	d->svc_range->end = prim->range.end;
+	DBG("deviceinfo changed, updating.");
 
-	btd_service_set_user_data(service, d);
-
-	d->attioid = btd_device_add_attio_callback(device, attio_connected_cb,
-						attio_disconnected_cb, d);
-	return 0;
+	init_deviceinfo_service(pdata);
 }
 
 static int deviceinfo_driver_probe(struct btd_service *service)
 {
 	struct btd_device *device = btd_service_get_device(service);
-	struct gatt_primary *prim;
+	struct profile_data *pdata;
 
-	prim = btd_device_get_primary(device, DEVICE_INFORMATION_UUID);
-	if (prim == NULL)
-		return -EINVAL;
+	pdata = new0(struct profile_data, 1);
+	pdata->dev = btd_device_ref(device);
 
-	return deviceinfo_register(service, prim);
+	if (!pdata->gatt_cb_id) {
+		pdata->gatt_cb_id = btd_device_add_gatt_callbacks(device,
+								gatt_ready_cb,
+								gatt_changed_cb,
+								NULL, pdata);
+	}
+
+	btd_service_set_user_data(service, pdata);
+
+	return 0;
+}
+
+static void deviceinfo_driver_remove(struct btd_service *service)
+{
+	struct profile_data *pdata = btd_service_get_user_data(service);
+
+	if (pdata->gatt_cb_id)
+		btd_device_remove_gatt_callbacks(pdata->dev, pdata->gatt_cb_id);
+
+	btd_device_unref(pdata->dev);
+
+	free(pdata);
 }
 
 static struct btd_profile deviceinfo_profile = {
