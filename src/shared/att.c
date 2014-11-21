@@ -1210,6 +1210,48 @@ unsigned int bt_att_send_error_rsp(struct bt_att *att, uint8_t opcode,
 							NULL, NULL, NULL);
 }
 
+const char *bt_att_ecode_to_string(uint8_t ecode)
+{
+	switch (ecode)  {
+	case BT_ATT_ERROR_INVALID_HANDLE:
+		return "Invalid handle";
+	case BT_ATT_ERROR_READ_NOT_PERMITTED:
+		return "Attribute can't be read";
+	case BT_ATT_ERROR_WRITE_NOT_PERMITTED:
+		return "Attribute can't be written";
+	case BT_ATT_ERROR_INVALID_PDU:
+		return "Attribute PDU was invalid";
+	case BT_ATT_ERROR_AUTHENTICATION:
+		return "Attribute requires authentication before read/write";
+	case BT_ATT_ERROR_REQUEST_NOT_SUPPORTED:
+		return "Server doesn't support the request received";
+	case BT_ATT_ERROR_INVALID_OFFSET:
+		return "Offset past the end of the attribute";
+	case BT_ATT_ERROR_AUTHORIZATION:
+		return "Attribute requires authorization before read/write";
+	case BT_ATT_ERROR_PREPARE_QUEUE_FULL:
+		return "Too many prepare writes have been queued";
+	case BT_ATT_ERROR_ATTRIBUTE_NOT_FOUND:
+		return "No attribute found within the given range";
+	case BT_ATT_ERROR_ATTRIBUTE_NOT_LONG:
+		return "Attribute can't be read/written using Read Blob Req";
+	case BT_ATT_ERROR_INSUFFICIENT_ENCRYPTION_KEY_SIZE:
+		return "Encryption Key Size is insufficient";
+	case BT_ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LEN:
+		return "Attribute value length is invalid";
+	case BT_ATT_ERROR_UNLIKELY:
+		return "Request attribute has encountered an unlikely error";
+	case BT_ATT_ERROR_INSUFFICIENT_ENCRYPTION:
+		return "Encryption required before read/write";
+	case BT_ATT_ERROR_UNSUPPORTED_GROUP_TYPE:
+		return "Attribute type is not a supported grouping attribute";
+	case BT_ATT_ERROR_INSUFFICIENT_RESOURCES:
+		return "Insufficient Resources to complete the request";
+	default:
+		return "Unknown error code";
+	}
+}
+
 unsigned int bt_att_register(struct bt_att *att, uint8_t opcode,
 						bt_att_notify_func_t callback,
 						void *user_data,
