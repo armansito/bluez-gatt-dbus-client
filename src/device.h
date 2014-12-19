@@ -148,6 +148,10 @@ bool device_remove_svc_complete_callback(struct btd_device *dev,
 
 struct btd_service *btd_device_get_service(struct btd_device *dev,
 						const char *remote_uuid);
+struct btd_service *btd_device_get_gatt_service(struct btd_device *dev,
+							const char *remote_uuid,
+							uint16_t start_handle,
+							uint16_t end_handle);
 
 int device_discover_services(struct btd_device *device);
 int btd_device_connect_services(struct btd_device *dev, GSList *services);

@@ -5431,6 +5431,33 @@ struct btd_service *btd_device_get_service(struct btd_device *dev,
 	return NULL;
 }
 
+struct btd_service *btd_device_get_gatt_service(struct btd_device *dev,
+							const char *remote_uuid,
+							uint16_t start_handle,
+							uint16_t end_handle)
+{
+	GSList *l;
+
+	if (!dev)
+		return NULL;
+
+	for (l = dev->services; l != NULL; l = g_slist_next(l)) {
+		struct btd_service *service = l->data;
+		struct btd_profile *p = btd_service_get_profile(service);
+		uint16_t start, end;
+
+		if (!btd_service_get_gatt_handles(service, &start, &end))
+			continue;
+
+		if (g_str_equal(p->remote_uuid, remote_uuid) &&
+							start == start_handle &&
+							end == end_handle)
+			return service;
+	}
+
+	return NULL;
+}
+
 void btd_device_init(void)
 {
 	dbus_conn = btd_get_dbus_connection();
