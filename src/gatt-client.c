@@ -1776,10 +1776,35 @@ static gboolean set_chrcs_ready(gpointer user_data)
 	return FALSE;
 }
 
+static bool is_service_claimed(struct btd_device *dev,
+						struct gatt_db_attribute *attr)
+{
+	uint16_t start, end;
+	bt_uuid_t uuid;
+	char uuid_str[MAX_LEN_UUID_STR];
+
+	if (!gatt_db_attribute_get_service_data(attr, &start, &end, NULL,
+									&uuid))
+		return false;
+
+	bt_uuid_to_string(&uuid, uuid_str, sizeof(uuid_str));
+
+	return !!btd_device_get_gatt_service(dev, uuid_str, start, end);
+}
+
 static void export_service(struct gatt_db_attribute *attr, void *user_data)
 {
 	struct btd_gatt_client *client = user_data;
 	struct service *service;
+
+	/*
+	 * Check if a profile claimed this service and don't export it
+	 * otherwise.
+	 */
+	if (is_service_claimed(client->device, attr)) {
+		DBG("GATT service already claimed by an internal profile");
+		return;
+	}
 
 	service = service_create(attr, client);
 	if (!service)
