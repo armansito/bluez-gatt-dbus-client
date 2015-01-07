@@ -344,6 +344,7 @@ static void desc_read_cb(bool success, uint8_t att_ecode,
 		return;
 	}
 
+	gatt_db_attribute_reset(desc->attr);
 	gatt_db_attribute_write(desc->attr, 0, value, length, 0, NULL,
 						write_descriptor_cb, desc);
 
@@ -773,6 +774,7 @@ static void chrc_read_cb(bool success, uint8_t att_ecode, const uint8_t *value,
 		return ;
 	}
 
+	gatt_db_attribute_reset(chrc->attr);
 	gatt_db_attribute_write(chrc->attr, 0, value, length, op->offset, NULL,
 						write_characteristic_cb, chrc);
 
