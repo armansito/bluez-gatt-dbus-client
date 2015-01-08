@@ -66,6 +66,7 @@ struct client {
 	int fd;
 	struct gatt_db *db;
 	struct bt_gatt_client *gatt;
+	unsigned int id;
 };
 
 static void print_prompt(void)
@@ -568,8 +569,9 @@ static void cmd_read_long_value(struct client *cli, char *cmd_str)
 		return;
 	}
 
-	if (!bt_gatt_client_read_long_value(cli->gatt, handle, offset, read_cb,
-								NULL, NULL))
+	if (!(cli->id = bt_gatt_client_read_long_value(cli->gatt, handle,
+								offset, read_cb,
+								NULL, NULL)))
 		printf("Failed to initiate read long value procedure\n");
 }
 
@@ -818,10 +820,11 @@ static void cmd_write_long_value(struct client *cli, char *cmd_str)
 		}
 	}
 
-	if (!bt_gatt_client_write_long_value(cli->gatt, reliable_writes, handle,
+	if (!(cli->id = bt_gatt_client_write_long_value(cli->gatt,
+							reliable_writes, handle,
 							offset, value, length,
 							write_long_cb,
-							NULL, NULL))
+							NULL, NULL)))
 		printf("Failed to initiate long write procedure\n");
 
 	free(value);
@@ -931,6 +934,16 @@ static void cmd_unregister_notify(struct client *cli, char *cmd_str)
 	printf("Unregistered notify handler with id: %u\n", id);
 }
 
+static void cmd_cancel(struct client *cli, char *cmd_str)
+{
+	if (!bt_gatt_client_cancel(cli->gatt, cli->id)) {
+		printf("Cancel failed\n");
+		return;
+	}
+
+	printf("Cancel succeeded\n");
+}
+
 static void cmd_help(struct client *cli, char *cmd_str);
 
 typedef void (*command_func_t)(struct client *cli, char *cmd_str);
@@ -955,6 +968,7 @@ static struct {
 			"\tSubscribe to not/ind from a characteristic" },
 	{ "unregister-notify", cmd_unregister_notify,
 						"Unregister a not/ind session"},
+	{ "c", cmd_cancel, "Cancel the operation (TESTING)" },
 	{ }
 };
 
